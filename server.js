@@ -44,6 +44,7 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       try {
         const { prompt, code } = JSON.parse(body);
+        console.log('analyze called, code match:', code === CLASS_CODE);
         if (code !== CLASS_CODE) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'クラスコードが正しくありません' })); return;
@@ -64,13 +65,26 @@ const server = http.createServer((req, res) => {
         };
         const apiReq = https.request(options, (apiRes) => {
           let data = '';
+          console.log('Gemini status:', apiRes.statusCode);
           apiRes.on('data', chunk => { data += chunk; });
-          apiRes.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(data); });
+          apiRes.on('end', () => {
+            console.log('Gemini response:', data.slice(0, 300));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(data);
+          });
         });
-        apiReq.on('error', (e) => { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.message })); });
+        apiReq.on('error', (e) => {
+          console.log('Gemini error:', e.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        });
         apiReq.write(postData);
         apiReq.end();
-      } catch(e) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '不正なリクエストです' })); }
+      } catch(e) {
+        console.log('parse error:', e.message);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: '不正なリクエストです' }));
+      }
     });
     return;
   }
