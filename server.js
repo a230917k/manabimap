@@ -6,7 +6,7 @@ const path = require('path');
 const API_KEY = process.env.GEMINI_API_KEY;
 const CLASS_CODE = process.env.CLASS_CODE || 'manabimap2025';
 const PORT = process.env.PORT || 3000;
-const GEMINI_MODEL = 'gemini-1.5-flash-latest';
+const GEMINI_MODEL = 'gemini-2.0-flash';
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
