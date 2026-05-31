@@ -3,10 +3,9 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const API_KEY = process.env.GEMINI_API_KEY;
+const API_KEY = process.env.OPENROUTER_API_KEY;
 const CLASS_CODE = process.env.CLASS_CODE || 'manabimap2025';
 const PORT = process.env.PORT || 3000;
-const GEMINI_MODEL = 'gemini-2.0-flash';
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -54,27 +53,44 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ error: 'promptが必要です' })); return;
         }
         const postData = JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.3 }
+          model: 'meta-llama/llama-3.3-70b-instruct:free',
+          messages: [
+            { role: 'system', content: 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。' },
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.3
         });
         const options = {
-          hostname: 'generativelanguage.googleapis.com',
-          path: `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`,
+          hostname: 'openrouter.ai',
+          path: '/api/v1/chat/completions',
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) }
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${API_KEY}`,
+            'HTTP-Referer': 'https://manabimap.onrender.com',
+            'X-Title': 'まなびマップ',
+            'Content-Length': Buffer.byteLength(postData)
+          }
         };
         const apiReq = https.request(options, (apiRes) => {
           let data = '';
-          console.log('Gemini status:', apiRes.statusCode);
+          console.log('OpenRouter status:', apiRes.statusCode);
           apiRes.on('data', chunk => { data += chunk; });
           apiRes.on('end', () => {
-            console.log('Gemini response:', data.slice(0, 300));
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(data);
+            console.log('OpenRouter response:', data.slice(0, 300));
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.message?.content || '';
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ content }));
+            } catch(e) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'レスポンス解析エラー' }));
+            }
           });
         });
         apiReq.on('error', (e) => {
-          console.log('Gemini error:', e.message);
+          console.log('OpenRouter error:', e.message);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: e.message }));
         });
