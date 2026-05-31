@@ -81,7 +81,8 @@ const server = http.createServer((req, res) => {
             console.log('OpenRouter response:', data.slice(0, 500));
             try {
               const parsed = JSON.parse(data);
-              const content = parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content ? parsed.choices[0].message.content : '';
+              let content = parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content ? parsed.choices[0].message.content : '';
+content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
               console.log('content:', content.slice(0, 200));
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ content: content }));
