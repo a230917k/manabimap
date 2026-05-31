@@ -68,7 +68,7 @@ const server = http.createServer((req, res) => {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${API_KEY}`,
             'HTTP-Referer': 'https://manabimap.onrender.com',
-            'X-Title': 'まなびマップ',
+            'X-Title': 'ManabiMap',
             'Content-Length': Buffer.byteLength(postData)
           }
         };
