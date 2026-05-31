@@ -55,10 +55,10 @@ const server = http.createServer((req, res) => {
         const postData = JSON.stringify({
           model: 'openrouter/auto',
           messages: [
-            { role: 'system', content: 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。' },
+            { role: 'system', content: 'You are a Japanese curriculum expert. Return JSON only. No explanation, no markdown.' },
             { role: 'user', content: prompt }
           ],
-          temperature: 0.3
+          temperature: 0.3,
           stream: false
         });
         const options = {
@@ -67,7 +67,7 @@ const server = http.createServer((req, res) => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${API_KEY}`,
+            'Authorization': 'Bearer ' + API_KEY,
             'HTTP-Referer': 'https://manabimap.onrender.com',
             'X-Title': 'ManabiMap',
             'Content-Length': Buffer.byteLength(postData)
@@ -78,13 +78,15 @@ const server = http.createServer((req, res) => {
           console.log('OpenRouter status:', apiRes.statusCode);
           apiRes.on('data', chunk => { data += chunk; });
           apiRes.on('end', () => {
-            console.log('OpenRouter response:', data.slice(0, 300));
+            console.log('OpenRouter response:', data.slice(0, 500));
             try {
               const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.message?.content || '';
+              const content = parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content ? parsed.choices[0].message.content : '';
+              console.log('content:', content.slice(0, 200));
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ content }));
+              res.end(JSON.stringify({ content: content }));
             } catch(e) {
+              console.log('parse error:', e.message);
               res.writeHead(500, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: 'レスポンス解析エラー' }));
             }
@@ -109,4 +111,4 @@ const server = http.createServer((req, res) => {
   res.writeHead(404); res.end('Not found');
 });
 
-server.listen(PORT, () => { console.log(`まなびマップ サーバー起動: ポート${PORT}`); });
+server.listen(PORT, () => { console.log('manabimap server started on port ' + PORT); });
