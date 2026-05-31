@@ -53,7 +53,7 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ error: 'promptが必要です' })); return;
         }
         const postData = JSON.stringify({
-          model: 'meta-llama/llama-3.3-70b-instruct:free',
+          model: 'google/gemini-2.0-flash-exp:free',
           messages: [
             { role: 'system', content: 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。' },
             { role: 'user', content: prompt }
