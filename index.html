@@ -378,7 +378,7 @@ async function submitReport(){
     });
     if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error?.message||`HTTP ${res.status}`);}
     const data=await res.json();
-    const raw=data.candidates?.[0]?.content?.parts?.[0]?.text||'';
+    const raw=data.content||'';
     let parsed=null;
     try{parsed=JSON.parse(raw.replace(/```json\s*|```\s*/g,'').trim());}catch(e1){
       try{const m=raw.match(/\{[\s\S]*"mappings"[\s\S]*\}/);if(m)parsed=JSON.parse(m[0]);}catch(e2){
