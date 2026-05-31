@@ -378,9 +378,9 @@ async function submitReport(){
     });
     if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error?.message||`HTTP ${res.status}`);}
     const data=await res.json();
-    const raw=(data.content||'').replace(/```json[\s\S]*?```/g,m=>m.replace(/```json\s*/,'').replace(/\s*```/,'')).replace(/```json\s*/g,'').replace(/```\s*/g,'').trim();
+    const raw=(data.content||'').replace(/`{3}json/g,'').replace(/`{3}/g,'').trim();
     let parsed=null;
-    try{parsed=JSON.parse(raw.replace(/```json\s*|```\s*/g,'').trim());}catch(e1){
+    try{parsed=JSON.parse(raw);}catch(e1){
       try{const m=raw.match(/\{[\s\S]*"mappings"[\s\S]*\}/);if(m)parsed=JSON.parse(m[0]);}catch(e2){
         try{const s=raw.indexOf('{'),e=raw.lastIndexOf('}');if(s!==-1&&e!==-1)parsed=JSON.parse(raw.slice(s,e+1));}catch(e3){throw new Error('JSONの解析に失敗しました。もう一度試してください。');}
       }
