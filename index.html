@@ -378,7 +378,7 @@ async function submitReport(){
     });
     if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error?.message||`HTTP ${res.status}`);}
     const data=await res.json();
-    const raw=(data.content||'').replace(/```json\s*/g,'').replace(/```\s*/g,'').trim();
+    const raw=(data.content||'').replace(/```json[\s\S]*?```/g,m=>m.replace(/```json\s*/,'').replace(/\s*```/,'')).replace(/```json\s*/g,'').replace(/```\s*/g,'').trim();
     let parsed=null;
     try{parsed=JSON.parse(raw.replace(/```json\s*|```\s*/g,'').trim());}catch(e1){
       try{const m=raw.match(/\{[\s\S]*"mappings"[\s\S]*\}/);if(m)parsed=JSON.parse(m[0]);}catch(e2){
