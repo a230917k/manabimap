@@ -59,6 +59,7 @@ const server = http.createServer((req, res) => {
             { role: 'user', content: prompt }
           ],
           temperature: 0.3
+          stream: false
         });
         const options = {
           hostname: 'openrouter.ai',
