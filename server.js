@@ -55,7 +55,7 @@ const server = http.createServer((req, res) => {
         const postData = JSON.stringify({
           model: 'openrouter/auto',
           messages: [
-            { role: 'system', content: 'You are a Japanese curriculum expert. Return JSON only. No explanation, no markdown.' },
+            { role: 'system', content: 'あなたは日本の学習指導要領の専門家です。JSONのみを返してください。説明・コードブロック不要。curriculum_referenceには通常の日本語テキストのみ使用し、特殊文字・記号・絵文字は使わないでください。' },
             { role: 'user', content: prompt }
           ],
           temperature: 0.3,
