@@ -55,7 +55,7 @@ const server = http.createServer((req, res) => {
         const postData = JSON.stringify({
           model: 'openrouter/auto',
           messages: [
-            { role: 'system', content: 'あなたは日本の学習指導要領の専門家です。JSONのみを返してください。説明・コードブロック不要。curriculum_referenceには通常の日本語テキストのみ使用し、特殊文字・記号・絵文字は使わないでください。小学1〜3年生の場合はfeedbackとoverall_commentの漢字すべてにHTMLのrubyタグでふりがなを振ってください（例：<ruby>学習<rt>がくしゅう</rt></ruby>）。小学4〜6年生の場合は難しい漢字のみにrubyタグを使ってください。中学生以上はrubyタグ不要です。' },
+            {role: 'system', content: 'あなたは日本の学習指導要領の専門家です。JSONのみを返してください。説明・コードブロック不要。以下のルールを必ず守ってください：1)curriculum_referenceは簡潔な1文のみ（長い引用文は不要）、2)feedbackとoverall_commentには絵文字・特殊記号・特殊文字を一切使わないこと、3)小学1〜3年生の場合はfeedbackとoverall_commentの漢字にHTMLのrubyタグでふりがなを振ること（例：<ruby>学習<rt>がくしゅう</rt></ruby>）、4)小学4〜6年生は難しい漢字のみrubyタグを使うこと、5)中学生以上はrubyタグ不要。' },
             { role: 'user', content: prompt }
           ],
           temperature: 0.3,
