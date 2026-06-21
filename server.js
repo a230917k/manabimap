@@ -42,8 +42,8 @@ const server = http.createServer((req, res) => {
     req.on('data', chunk => { body += chunk.toString(); });
     req.on('end', () => {
       try {
-        const { prompt, code } = JSON.parse(body);
-        console.log('analyze called, code match:', code === CLASS_CODE);
+        const { prompt, code, raw } = JSON.parse(body);
+        console.log('analyze called, code match:', code === CLASS_CODE, 'raw:', !!raw);
         if (code !== CLASS_CODE) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'クラスコードが正しくありません' })); return;
@@ -52,10 +52,16 @@ const server = http.createServer((req, res) => {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'promptが必要です' })); return;
         }
+
+        // rawモード：テキストをそのまま返す（つながり説明用）
+        const systemPrompt = raw
+          ? 'あなたは教育の専門家です。指示された内容を日本語で答えてください。JSONは不要です。'
+          : 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。curriculum_referenceは簡潔な1文のみ。feedbackとoverall_commentには絵文字・特殊記号・特殊文字を一切使わないこと。小学1〜3年生の場合はfeedbackとoverall_commentの漢字にHTMLのrubyタグでふりがなを振ること（例：<ruby>学習<rt>がくしゅう</rt></ruby>）。小学4〜6年生は難しい漢字のみrubyタグ。中学生以上はrubyタグ不要。';
+
         const postData = JSON.stringify({
           model: 'openrouter/auto',
           messages: [
-            {role: 'system', content: 'あなたは日本の学習指導要領の専門家です。JSONのみを返してください。説明・コードブロック不要。以下のルールを必ず守ってください：1)curriculum_referenceは簡潔な1文のみ（長い引用文は不要）、2)feedbackとoverall_commentには絵文字・特殊記号・特殊文字を一切使わないこと、3)小学1〜3年生の場合はfeedbackとoverall_commentの漢字にHTMLのrubyタグでふりがなを振ること（例：<ruby>学習<rt>がくしゅう</rt></ruby>）、4)小学4〜6年生は難しい漢字のみrubyタグを使うこと、5)中学生以上はrubyタグ不要。' },
+            { role: 'system', content: systemPrompt },
             { role: 'user', content: prompt }
           ],
           temperature: 0.3,
@@ -78,14 +84,17 @@ const server = http.createServer((req, res) => {
           console.log('OpenRouter status:', apiRes.statusCode);
           apiRes.on('data', chunk => { data += chunk; });
           apiRes.on('end', () => {
-            console.log('OpenRouter response:', data.slice(0, 500));
+            console.log('OpenRouter response:', data.slice(0, 300));
             try {
               const parsed = JSON.parse(data);
-              let content = parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content ? parsed.choices[0].message.content : '';
-content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+              let content = parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content
+                ? parsed.choices[0].message.content : '';
+              if (!raw) {
+                content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+              }
               console.log('content:', content.slice(0, 200));
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ content: content }));
+              res.end(JSON.stringify({ content }));
             } catch(e) {
               console.log('parse error:', e.message);
               res.writeHead(500, { 'Content-Type': 'application/json' });
