@@ -105,6 +105,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 個別児童取得
+  if (req.method === 'GET' && req.url.match(/^\/api\/students\/[^?]+(\?.*)?$/)) {
+    const id = req.url.split('/')[3].split('?')[0];
+    const code = new URL(req.url, 'http://x').searchParams.get('code');
+    if (code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+    supabase('GET', 'students?id=eq.'+id, null, (err, data) => {
+      sendJSON(res, Array.isArray(data)&&data.length?data[0]:{});
+    });
+    return;
+  }
+
   // 全児童取得（先生用）
   if (req.method === 'GET' && req.url.startsWith('/api/students')) {
     const code = new URL(req.url, 'http://x').searchParams.get('code');
