@@ -20,11 +20,11 @@ function supabase(method, path, body, callback) {
     headers: {
       'apikey': SUPABASE_SECRET_KEY,
       'Authorization': 'Bearer ' + SUPABASE_SECRET_KEY,
-      'Content-Type': 'application/json',
-      'Prefer': method === 'POST' ? 'return=representation' : undefined
+      'Content-Type': 'application/json'
     }
   };
   if (data) options.headers['Content-Length'] = Buffer.byteLength(data);
+  if (method === 'POST') options.headers['Prefer'] = 'return=representation';
   const req = https.request(options, (res) => {
     let d = '';
     res.on('data', chunk => d += chunk);
