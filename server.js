@@ -111,7 +111,10 @@ const server = http.createServer((req, res) => {
     const code = new URL(req.url, 'http://x').searchParams.get('code');
     if (code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
     supabase('GET', 'students?id=eq.'+id, null, (err, data) => {
-      sendJSON(res, Array.isArray(data)&&data.length?data[0]:{});
+      const student = Array.isArray(data)&&data.length?data[0]:{};
+      console.log('student data:', JSON.stringify(student));
+      console.log('grade_lock type:', typeof student.grade_lock, 'value:', student.grade_lock);
+      sendJSON(res, student);
     });
     return;
   }
@@ -183,6 +186,18 @@ const server = http.createServer((req, res) => {
     if (code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
     supabase('GET', `reports?class_code=eq.${CLASS_CODE}&order=date.desc`, null, (err, data) => {
       sendJSON(res, data || []);
+    });
+    return;
+  }
+
+  // 先生コメント更新
+  if (req.method === 'PUT' && req.url.startsWith('/api/reports/comment/')) {
+    const rid = req.url.split('/')[4].split('?')[0];
+    readBody(req, (err, body) => {
+      if (err || body.code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      supabase('PATCH', 'reports?id=eq.'+rid, { teacher_comment: body.comment||'' }, (err, data) => {
+        sendJSON(res, { ok: true });
+      });
     });
     return;
   }
