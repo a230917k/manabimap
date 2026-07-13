@@ -115,6 +115,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 児童情報更新（学年・ロック設定）
+  if (req.method === 'PUT' && req.url.startsWith('/api/students/')) {
+    const id = req.url.split('/')[3];
+    readBody(req, (err, body) => {
+      if (err || body.code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const updates = {};
+      if (body.grade !== undefined) updates.grade = body.grade;
+      if (body.grade_lock !== undefined) updates.grade_lock = body.grade_lock;
+      supabase('PATCH', 'students?id=eq.'+id, updates, (err, data) => {
+        sendJSON(res, { ok: true });
+      });
+    });
+    return;
+  }
+
   // レポート保存
   if (req.method === 'POST' && req.url === '/api/reports') {
     readBody(req, (err, body) => {
