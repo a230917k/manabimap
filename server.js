@@ -131,17 +131,86 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 先生認証
+  // 先生認証（teachersテーブル＋classesテーブル両対応）
   if (req.method === 'POST' && req.url === '/api/teacher-login') {
     readBody(req, (err, body) => {
       if (err) { res.writeHead(400); res.end(); return; }
-      supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(body.code), null, (err, data) => {
-        const cls = Array.isArray(data) && data.length ? data[0] : null;
-        if (cls && cls.teacher_password === body.password) {
-          sendJSON(res, { ok: true, class: cls });
-        } else {
-          sendJSON(res, { ok: false });
-        }
+      const { account_id, password, code } = body;
+      if (account_id) {
+        // 先生アカウントIDでログイン
+        supabase('GET', 'teachers?account_id=eq.'+encodeURIComponent(account_id), null, (err, tData) => {
+          const teacher = Array.isArray(tData) && tData.length ? tData[0] : null;
+          if (!teacher || teacher.password !== password) {
+            sendJSON(res, { ok: false }); return;
+          }
+          // 所属クラスを取得
+          supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(teacher.class_code), null, (err, cData) => {
+            const cls = Array.isArray(cData) && cData.length ? cData[0] : null;
+            sendJSON(res, { ok: true, class: cls, teacher });
+          });
+        });
+      } else if (code) {
+        // クラスコード＋パスワードでログイン（後方互換）
+        supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(code), null, (err, data) => {
+          const cls = Array.isArray(data) && data.length ? data[0] : null;
+          if (cls && cls.teacher_password === password) {
+            sendJSON(res, { ok: true, class: cls });
+          } else {
+            sendJSON(res, { ok: false });
+          }
+        });
+      } else {
+        sendJSON(res, { ok: false });
+      }
+    });
+    return;
+  }
+
+  // 先生一覧取得
+  if (req.method === 'GET' && req.url.startsWith('/api/teachers')) {
+    const params = new URL(req.url, 'http://x').searchParams;
+    const classCode = params.get('class_code');
+    const schoolCode = params.get('school_code');
+    if (schoolCode && schoolCode === SCHOOL_CODE) {
+      supabase('GET', 'teachers?school_code=eq.'+encodeURIComponent(schoolCode)+'&order=created_at.asc', null, (err, data) => {
+        sendJSON(res, data || []);
+      });
+    } else if (classCode) {
+      supabase('GET', 'teachers?class_code=eq.'+encodeURIComponent(classCode)+'&order=created_at.asc', null, (err, data) => {
+        sendJSON(res, data || []);
+      });
+    } else {
+      sendJSON(res, { error: 'unauthorized' }, 403);
+    }
+    return;
+  }
+
+  // 先生登録
+  if (req.method === 'POST' && req.url === '/api/teachers') {
+    readBody(req, (err, body) => {
+      if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const teacher = {
+        id: 't' + Date.now(),
+        account_id: body.account_id || genAccountId(),
+        name: body.name,
+        class_code: body.class_code,
+        school_code: SCHOOL_CODE,
+        password: body.password || genAccountId().toLowerCase(),
+      };
+      supabase('POST', 'teachers', teacher, (err, data) => {
+        sendJSON(res, { ok: true, teacher: Array.isArray(data) ? data[0] : data });
+      });
+    });
+    return;
+  }
+
+  // 先生削除
+  if (req.method === 'DELETE' && req.url.startsWith('/api/teachers/')) {
+    const id = req.url.split('/')[3];
+    readBody(req, (err, body) => {
+      if (err || !body || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      supabase('DELETE', 'teachers?id=eq.'+id, null, (err, data) => {
+        sendJSON(res, { ok: true });
       });
     });
     return;
