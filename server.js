@@ -10,6 +10,16 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 
+// 8桁アカウントIDを生成
+function genAccountId() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 紛らわしい文字を除外
+  let id = '';
+  for (let i = 0; i < 8; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return id;
+}
+
 function supabase(method, path, body, callback) {
   const data = body ? JSON.stringify(body) : null;
   const options = {
@@ -96,6 +106,7 @@ const server = http.createServer((req, res) => {
       if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
       const cls = {
         id: 'cls' + Date.now(),
+        account_id: body.account_id || genAccountId(),
         name: body.name || 'クラス',
         school_code: SCHOOL_CODE,
         class_code: body.class_code,
@@ -162,7 +173,7 @@ const server = http.createServer((req, res) => {
             sendJSON(res, { student: rows[0] });
           } else {
             const id = 's' + Date.now();
-            supabase('POST', 'students', { id, name: body.name, class_code: classCode, class_id: cls.id }, (err, data) => {
+            supabase('POST', 'students', { id, account_id: body.account_id || genAccountId(), name: body.name, class_code: classCode, class_id: cls.id }, (err, data) => {
               sendJSON(res, { student: Array.isArray(data) ? data[0] : data });
             });
           }
@@ -279,6 +290,54 @@ const server = http.createServer((req, res) => {
       if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
       supabase('PATCH', 'reports?id=eq.'+rid, { teacher_comment: body.comment || '' }, (err, data) => {
         sendJSON(res, { ok: true });
+      });
+    });
+    return;
+  }
+
+  // CSVインポート（一括登録）
+  if (req.method === 'POST' && req.url === '/api/import') {
+    readBody(req, (err, body) => {
+      if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const records = body.records || [];
+      let created = { classes: 0, students: 0, teachers: 0 };
+      let pending = records.length;
+      if (!pending) { sendJSON(res, { ok: true, created }); return; }
+
+      const done = () => { if (--pending === 0) sendJSON(res, { ok: true, created }); };
+
+      records.forEach(r => {
+        if (r.type === 'class') {
+          const cls = {
+            id: 'cls' + Date.now() + Math.random().toString(36).slice(2,5),
+            account_id: r.account_id || genAccountId(),
+            name: r.name,
+            school_code: SCHOOL_CODE,
+            class_code: r.class_code || genAccountId().toLowerCase(),
+            teacher_password: r.teacher_password || genAccountId().toLowerCase(),
+          };
+          supabase('POST', 'classes', cls, (e, d) => { created.classes++; done(); });
+        } else if (r.type === 'student') {
+          const stu = {
+            id: 's' + Date.now() + Math.random().toString(36).slice(2,5),
+            account_id: r.account_id || genAccountId(),
+            name: r.name,
+            class_code: r.class_code || '',
+            class_id: r.class_id || null,
+          };
+          supabase('POST', 'students', stu, (e, d) => { created.students++; done(); });
+        } else if (r.type === 'teacher') {
+          const teacher = {
+            id: 't' + Date.now() + Math.random().toString(36).slice(2,5),
+            account_id: r.account_id || genAccountId(),
+            name: r.name,
+            class_code: r.class_code || '',
+            school_code: SCHOOL_CODE,
+          };
+          supabase('POST', 'teachers', teacher, (e, d) => { created.teachers++; done(); });
+        } else {
+          done();
+        }
       });
     });
     return;
