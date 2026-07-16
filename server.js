@@ -4,13 +4,12 @@ const fs = require('fs');
 const path = require('path');
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const CLASS_CODE = process.env.CLASS_CODE || 'manabimap2025';
-const TEACHER_PASSWORD = process.env.TEACHER_PASSWORD || 'teacher2025';
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+const SCHOOL_CODE = process.env.SCHOOL_CODE || 'school2025'; // 学校管理者用コード
 const PORT = process.env.PORT || 3000;
 
-// Supabase APIを呼ぶ汎用関数
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+
 function supabase(method, path, body, callback) {
   const data = body ? JSON.stringify(body) : null;
   const options = {
@@ -20,11 +19,11 @@ function supabase(method, path, body, callback) {
     headers: {
       'apikey': SUPABASE_SECRET_KEY,
       'Authorization': 'Bearer ' + SUPABASE_SECRET_KEY,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
     }
   };
-  if (data) options.headers['Content-Length'] = Buffer.byteLength(data);
   if (method === 'POST') options.headers['Prefer'] = 'return=representation';
+  if (data) options.headers['Content-Length'] = Buffer.byteLength(data);
   const req = https.request(options, (res) => {
     let d = '';
     res.on('data', chunk => d += chunk);
@@ -68,11 +67,55 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // クラスコード認証
+  // ── クラス管理 ──────────────────────────────
+
+  // クラス一覧取得（学校コードで認証）
+  if (req.method === 'GET' && req.url.startsWith('/api/classes')) {
+    const params = new URL(req.url, 'http://x').searchParams;
+    const schoolCode = params.get('school_code');
+    const classCode = params.get('class_code');
+    if (classCode) {
+      // 特定クラスを取得（class_codeで）
+      supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(classCode), null, (err, data) => {
+        sendJSON(res, Array.isArray(data) && data.length ? data[0] : null);
+      });
+    } else if (schoolCode && schoolCode === SCHOOL_CODE) {
+      // 学校全体のクラス一覧
+      supabase('GET', 'classes?school_code=eq.'+encodeURIComponent(schoolCode)+'&order=created_at.asc', null, (err, data) => {
+        sendJSON(res, data || []);
+      });
+    } else {
+      sendJSON(res, { error: 'unauthorized' }, 403);
+    }
+    return;
+  }
+
+  // クラス作成（学校管理者用）
+  if (req.method === 'POST' && req.url === '/api/classes') {
+    readBody(req, (err, body) => {
+      if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const cls = {
+        id: 'cls' + Date.now(),
+        name: body.name || 'クラス',
+        school_code: SCHOOL_CODE,
+        class_code: body.class_code,
+        teacher_password: body.teacher_password,
+      };
+      supabase('POST', 'classes', cls, (err, data) => {
+        sendJSON(res, { ok: true, class: Array.isArray(data) ? data[0] : data });
+      });
+    });
+    return;
+  }
+
+  // クラスコード認証（児童・先生共通）
   if (req.method === 'POST' && req.url === '/api/verify') {
     readBody(req, (err, body) => {
       if (err) { res.writeHead(400); res.end(); return; }
-      sendJSON(res, { ok: body.code === CLASS_CODE });
+      supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(body.code), null, (err, data) => {
+        const cls = Array.isArray(data) && data.length ? data[0] : null;
+        sendJSON(res, { ok: !!cls, class: cls });
+      });
     });
     return;
   }
@@ -81,25 +124,49 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/api/teacher-login') {
     readBody(req, (err, body) => {
       if (err) { res.writeHead(400); res.end(); return; }
-      sendJSON(res, { ok: body.password === TEACHER_PASSWORD && body.code === CLASS_CODE });
+      supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(body.code), null, (err, data) => {
+        const cls = Array.isArray(data) && data.length ? data[0] : null;
+        if (cls && cls.teacher_password === body.password) {
+          sendJSON(res, { ok: true, class: cls });
+        } else {
+          sendJSON(res, { ok: false });
+        }
+      });
     });
     return;
   }
 
+  // 学校管理者認証
+  if (req.method === 'POST' && req.url === '/api/admin-login') {
+    readBody(req, (err, body) => {
+      if (err) { res.writeHead(400); res.end(); return; }
+      sendJSON(res, { ok: body.school_code === SCHOOL_CODE });
+    });
+    return;
+  }
+
+  // ── 児童管理 ──────────────────────────────
+
   // 児童登録・取得
   if (req.method === 'POST' && req.url === '/api/students') {
     readBody(req, (err, body) => {
-      if (err || body.code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
-      // 既存チェック
-      supabase('GET', `students?class_code=eq.${CLASS_CODE}&name=eq.${encodeURIComponent(body.name)}`, null, (err, rows) => {
-        if (rows && rows.length > 0) {
-          sendJSON(res, { student: rows[0] });
-        } else {
-          const id = 's' + Date.now();
-          supabase('POST', 'students', { id, name: body.name, class_code: CLASS_CODE }, (err, data) => {
-            sendJSON(res, { student: Array.isArray(data) ? data[0] : data });
-          });
-        }
+      if (err) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const classCode = body.code;
+      // クラスを確認
+      supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(classCode), null, (err, clsData) => {
+        const cls = Array.isArray(clsData) && clsData.length ? clsData[0] : null;
+        if (!cls) { sendJSON(res, { error: 'invalid class' }, 403); return; }
+        // 既存チェック
+        supabase('GET', 'students?class_code=eq.'+encodeURIComponent(classCode)+'&name=eq.'+encodeURIComponent(body.name), null, (err, rows) => {
+          if (rows && rows.length > 0) {
+            sendJSON(res, { student: rows[0] });
+          } else {
+            const id = 's' + Date.now();
+            supabase('POST', 'students', { id, name: body.name, class_code: classCode, class_id: cls.id }, (err, data) => {
+              sendJSON(res, { student: Array.isArray(data) ? data[0] : data });
+            });
+          }
+        });
       });
     });
     return;
@@ -109,31 +176,37 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url.match(/^\/api\/students\/[^?]+(\?.*)?$/)) {
     const id = req.url.split('/')[3].split('?')[0];
     const code = new URL(req.url, 'http://x').searchParams.get('code');
-    if (code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
     supabase('GET', 'students?id=eq.'+id, null, (err, data) => {
-      const student = Array.isArray(data)&&data.length?data[0]:{};
-      console.log('student data:', JSON.stringify(student));
-      console.log('grade_lock type:', typeof student.grade_lock, 'value:', student.grade_lock);
-      sendJSON(res, student);
+      sendJSON(res, Array.isArray(data) && data.length ? data[0] : {});
     });
     return;
   }
 
-  // 全児童取得（先生用）
+  // 全児童取得（先生・クラス別）
   if (req.method === 'GET' && req.url.startsWith('/api/students')) {
-    const code = new URL(req.url, 'http://x').searchParams.get('code');
-    if (code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
-    supabase('GET', `students?class_code=eq.${CLASS_CODE}&order=created_at.asc`, null, (err, data) => {
-      sendJSON(res, data || []);
-    });
+    const params = new URL(req.url, 'http://x').searchParams;
+    const code = params.get('code');
+    const schoolCode = params.get('school_code');
+    if (schoolCode && schoolCode === SCHOOL_CODE) {
+      // 学校全体の児童
+      supabase('GET', 'students?order=created_at.asc', null, (err, data) => {
+        sendJSON(res, data || []);
+      });
+    } else if (code) {
+      supabase('GET', 'students?class_code=eq.'+encodeURIComponent(code)+'&order=created_at.asc', null, (err, data) => {
+        sendJSON(res, data || []);
+      });
+    } else {
+      sendJSON(res, { error: 'unauthorized' }, 403);
+    }
     return;
   }
 
-  // 児童情報更新（学年・ロック設定）
+  // 児童情報更新
   if (req.method === 'PUT' && req.url.startsWith('/api/students/')) {
     const id = req.url.split('/')[3];
     readBody(req, (err, body) => {
-      if (err || body.code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
       const updates = {};
       if (body.grade !== undefined) updates.grade = body.grade;
       if (body.grade_lock !== undefined) updates.grade_lock = body.grade_lock;
@@ -144,14 +217,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── レポート管理 ──────────────────────────────
+
   // レポート保存
   if (req.method === 'POST' && req.url === '/api/reports') {
     readBody(req, (err, body) => {
-      if (err || body.code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
       const report = {
         id: body.id || ('r' + Date.now()),
         student_id: body.student_id,
-        class_code: CLASS_CODE,
+        class_code: body.code,
+        class_id: body.class_id || null,
         title: body.title || '',
         text: body.text || '',
         photo: body.photo || null,
@@ -168,25 +244,31 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // レポート取得（児童用）
+  // レポート取得（児童別）
   if (req.method === 'GET' && req.url.startsWith('/api/reports/student/')) {
-    const parts = req.url.split('/');
-    const studentId = parts[4].split('?')[0];
-    const code = new URL(req.url, 'http://x').searchParams.get('code');
-    if (code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
-    supabase('GET', `reports?student_id=eq.${studentId}&order=date.desc`, null, (err, data) => {
+    const studentId = req.url.split('/')[4].split('?')[0];
+    supabase('GET', 'reports?student_id=eq.'+studentId+'&order=date.desc', null, (err, data) => {
       sendJSON(res, data || []);
     });
     return;
   }
 
-  // レポート取得（先生用・全員）
+  // レポート取得（クラス別・先生用）
   if (req.method === 'GET' && req.url.startsWith('/api/reports/all')) {
-    const code = new URL(req.url, 'http://x').searchParams.get('code');
-    if (code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
-    supabase('GET', `reports?class_code=eq.${CLASS_CODE}&order=date.desc`, null, (err, data) => {
-      sendJSON(res, data || []);
-    });
+    const params = new URL(req.url, 'http://x').searchParams;
+    const code = params.get('code');
+    const schoolCode = params.get('school_code');
+    if (schoolCode && schoolCode === SCHOOL_CODE) {
+      supabase('GET', 'reports?order=date.desc', null, (err, data) => {
+        sendJSON(res, data || []);
+      });
+    } else if (code) {
+      supabase('GET', 'reports?class_code=eq.'+encodeURIComponent(code)+'&order=date.desc', null, (err, data) => {
+        sendJSON(res, data || []);
+      });
+    } else {
+      sendJSON(res, { error: 'unauthorized' }, 403);
+    }
     return;
   }
 
@@ -194,8 +276,8 @@ const server = http.createServer((req, res) => {
   if (req.method === 'PUT' && req.url.startsWith('/api/reports/comment/')) {
     const rid = req.url.split('/')[4].split('?')[0];
     readBody(req, (err, body) => {
-      if (err || body.code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
-      supabase('PATCH', 'reports?id=eq.'+rid, { teacher_comment: body.comment||'' }, (err, data) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      supabase('PATCH', 'reports?id=eq.'+rid, { teacher_comment: body.comment || '' }, (err, data) => {
         sendJSON(res, { ok: true });
       });
     });
@@ -205,7 +287,7 @@ const server = http.createServer((req, res) => {
   // AI分析
   if (req.method === 'POST' && req.url === '/api/analyze') {
     readBody(req, (err, body) => {
-      if (err || body.code !== CLASS_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
       const { prompt, raw, image, mediaType } = body;
       const systemPrompt = raw
         ? 'あなたは教育の専門家です。指示された内容を日本語で答えてください。JSONは不要です。'
