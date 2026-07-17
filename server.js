@@ -193,6 +193,8 @@ const server = http.createServer((req, res) => {
         id: 't' + Date.now(),
         account_id: body.account_id || genAccountId(),
         name: body.name,
+        yomi: body.yomi || '',
+        role: body.role || '',
         class_code: body.class_code,
         school_code: SCHOOL_CODE,
         password: body.password || genAccountId().toLowerCase(),
@@ -236,16 +238,31 @@ const server = http.createServer((req, res) => {
       supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(classCode), null, (err, clsData) => {
         const cls = Array.isArray(clsData) && clsData.length ? clsData[0] : null;
         if (!cls) { sendJSON(res, { error: 'invalid class' }, 403); return; }
-        // 既存チェック
+        // 既存チェック（名前またはふりがなで検索）
         supabase('GET', 'students?class_code=eq.'+encodeURIComponent(classCode)+'&name=eq.'+encodeURIComponent(body.name), null, (err, rows) => {
           if (rows && rows.length > 0) {
-            sendJSON(res, { student: rows[0] });
-          } else {
+            sendJSON(res, { student: rows[0] }); return;
+          }
+          // ふりがなでも検索
+          supabase('GET', 'students?class_code=eq.'+encodeURIComponent(classCode)+'&yomi=eq.'+encodeURIComponent(body.name), null, (err, rows2) => {
+            if (rows2 && rows2.length > 0) {
+              sendJSON(res, { student: rows2[0] }); return;
+            }
+            {
             const id = 's' + Date.now();
-            supabase('POST', 'students', { id, account_id: body.account_id || genAccountId(), name: body.name, class_code: classCode, class_id: cls.id }, (err, data) => {
+            supabase('POST', 'students', {
+              id,
+              account_id: body.account_id || genAccountId(),
+              name: body.name,
+              yomi: body.yomi || '',
+              role: body.role || '',
+              class_code: classCode,
+              class_id: cls.id
+            }, (err, data) => {
               sendJSON(res, { student: Array.isArray(data) ? data[0] : data });
             });
-          }
+            }
+          });
         });
       });
     });
@@ -386,22 +403,36 @@ const server = http.createServer((req, res) => {
             teacher_password: r.teacher_password || genAccountId().toLowerCase(),
           };
           supabase('POST', 'classes', cls, (e, d) => { created.classes++; done(); });
-        } else if (r.type === 'student') {
+        } else if (r.type === 'student' || r.type === '児童') {
           const stu = {
             id: 's' + Date.now() + Math.random().toString(36).slice(2,5),
             account_id: r.account_id || genAccountId(),
             name: r.name,
+            yomi: r.yomi || '',
+            role: r.role || '',
             class_code: r.class_code || '',
             class_id: r.class_id || null,
           };
-          supabase('POST', 'students', stu, (e, d) => { created.students++; done(); });
-        } else if (r.type === 'teacher') {
+          // classesからclass_idを取得
+          if (r.class_code) {
+            supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(r.class_code), null, (e, clsData) => {
+              const cls = Array.isArray(clsData) && clsData.length ? clsData[0] : null;
+              if (cls) stu.class_id = cls.id;
+              supabase('POST', 'students', stu, (e2, d) => { created.students++; done(); });
+            });
+          } else {
+            supabase('POST', 'students', stu, (e, d) => { created.students++; done(); });
+          }
+        } else if (r.type === 'teacher' || r.type === '先生') {
           const teacher = {
             id: 't' + Date.now() + Math.random().toString(36).slice(2,5),
             account_id: r.account_id || genAccountId(),
             name: r.name,
+            yomi: r.yomi || '',
+            role: r.role || '',
             class_code: r.class_code || '',
             school_code: SCHOOL_CODE,
+            password: r.password || genAccountId().toLowerCase(),
           };
           supabase('POST', 'teachers', teacher, (e, d) => { created.teachers++; done(); });
         } else {
