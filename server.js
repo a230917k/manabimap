@@ -283,6 +283,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 児童ログイン（クラスコード＋アカウントID＋名前の3つで認証）
+  if (req.method === 'POST' && req.url === '/api/students/login') {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const { account_id, name, code } = body;
+      if (!account_id || !name || !code) {
+        sendJSON(res, { error: 'missing fields' }, 400); return;
+      }
+      // クラスコード＋アカウントIDで検索
+      supabase('GET',
+        'students?account_id=eq.'+encodeURIComponent(account_id)+'&class_code=eq.'+encodeURIComponent(code),
+        null, (err, data) => {
+          const student = Array.isArray(data) && data.length ? data[0] : null;
+          if (!student) { sendJSON(res, { student: null }); return; }
+          // 名前またはふりがなで照合
+          const nameMatch = student.name === name || student.yomi === name;
+          if (nameMatch) {
+            sendJSON(res, { student });
+          } else {
+            sendJSON(res, { student: null });
+          }
+        }
+      );
+    });
+    return;
+  }
+
   // 個別児童取得
   if (req.method === 'GET' && req.url.match(/^\/api\/students\/[^?]+(\?.*)?$/)) {
     const id = req.url.split('/')[3].split('?')[0];
