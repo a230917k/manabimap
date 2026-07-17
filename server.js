@@ -256,6 +256,7 @@ const server = http.createServer((req, res) => {
               name: body.name,
               yomi: body.yomi || '',
               role: body.role || '',
+              seq: body.seq || null,
               class_code: classCode,
               class_id: cls.id
             }, (err, data) => {
@@ -410,6 +411,7 @@ const server = http.createServer((req, res) => {
             name: r.name,
             yomi: r.yomi || '',
             role: r.role || '',
+            seq: r.seq ? parseInt(r.seq) : null,
             class_code: r.class_code || '',
             class_id: r.class_id || null,
           };
