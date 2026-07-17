@@ -11,6 +11,19 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 
 // 8桁アカウントIDを生成
+// 学年変換（数字→日本語）
+function convertGrade(gradeStr) {
+  if (!gradeStr) return '';
+  const g = String(gradeStr).trim();
+  const map = {
+    '1':'小1','2':'小2','3':'小3','4':'小4','5':'小5','6':'小6',
+    '7':'中1','8':'中2','9':'中3','10':'高1','11':'高2','12':'高3',
+    '小1':'小1','小2':'小2','小3':'小3','小4':'小4','小5':'小5','小6':'小6',
+    '中1':'中1','中2':'中2','中3':'中3','高1':'高1','高2':'高2','高3':'高3',
+  };
+  return map[g] || g;
+}
+
 function genAccountId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 紛らわしい文字を除外
   let id = '';
@@ -405,6 +418,7 @@ const server = http.createServer((req, res) => {
           };
           supabase('POST', 'classes', cls, (e, d) => { created.classes++; done(); });
         } else if (r.type === 'student' || r.type === '児童') {
+          const grade = convertGrade(r.grade);
           const stu = {
             id: 's' + Date.now() + Math.random().toString(36).slice(2,5),
             account_id: r.account_id || genAccountId(),
@@ -412,6 +426,8 @@ const server = http.createServer((req, res) => {
             yomi: r.yomi || '',
             role: r.role || '',
             seq: r.seq ? parseInt(r.seq) : null,
+            grade: grade,
+            grade_lock: grade ? true : false,
             class_code: r.class_code || '',
             class_id: r.class_id || null,
           };
