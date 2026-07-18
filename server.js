@@ -625,7 +625,7 @@ const server = http.createServer((req, res) => {
       const { prompt, raw, image, mediaType } = body;
       const systemPrompt = raw
         ? 'あなたは教育の専門家です。指示された内容を日本語で答えてください。JSONは不要です。'
-        : 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。curriculum_referenceは簡潔な1文のみ。feedbackとoverall_commentには絵文字・特殊記号・特殊文字・装飾文字を一切使わないこと。通常のひらがな・カタカナ・漢字・句読点のみ使用すること。小学1〜3年生の場合はfeedbackとoverall_commentの漢字にHTMLのrubyタグでふりがなを振ること（例：<ruby>学習<rt>がくしゅう</rt></ruby>）。小学4〜6年生は難しい漢字のみrubyタグ。中学生以上はrubyタグ不要。';
+        : 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。curriculum_referenceは簡潔な1文のみ。feedbackとoverall_commentには絵文字を使ってよいですが、サロゲートペアになる文字（壊れて表示される文字）は使わないこと。小学1〜3年生の場合はfeedbackとoverall_commentの漢字にHTMLのrubyタグでふりがなを振ること（例：<ruby>学習<rt>がくしゅう</rt></ruby>）。小学4〜6年生は難しい漢字のみrubyタグ。中学生以上はrubyタグ不要。';
       let userContent = image
         ? [{ type: 'image_url', image_url: { url: `data:${mediaType||'image/jpeg'};base64,${image}` } }, { type: 'text', text: prompt }]
         : prompt;
@@ -654,6 +654,8 @@ const server = http.createServer((req, res) => {
             const parsed = JSON.parse(data);
             let content = parsed.choices?.[0]?.message?.content || '';
             if (!raw) content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+            // サロゲートペア・置換文字のみ除去（絵文字は残す）
+            content = content.replace(/\uFFFD/g, '').replace(/[\uD800-\uDFFF]/g, '');
             sendJSON(res, { content });
           } catch(e) { sendJSON(res, { error: 'parse error' }, 500); }
         });
