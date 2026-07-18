@@ -410,6 +410,129 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 課題一覧取得
+  if (req.method === 'GET' && req.url.startsWith('/api/assignments')) {
+    const params = new URL(req.url, 'http://x').searchParams;
+    const classCode = params.get('class_code');
+    const schoolCode = params.get('school_code');
+    const studentId = params.get('student_id');
+    if (studentId) {
+      // 児童向け：学校全体・学年・クラス・個人の課題を全取得
+      supabase('GET', 'students?id=eq.'+studentId, null, (err, stuData) => {
+        const stu = Array.isArray(stuData)&&stuData.length?stuData[0]:null;
+        if (!stu) { sendJSON(res, []); return; }
+        supabase('GET', 'assignments?school_code=eq.'+encodeURIComponent(stu.school_code||schoolCode||'')+'&order=created_at.desc', null, (err, data) => {
+          const all = Array.isArray(data)?data:[];
+          // target_typeで絞り込み
+          const filtered = all.filter(a => {
+            if (a.target_type === 'school') return true;
+            if (a.target_type === 'grade') return stu.grade === a.target_value;
+            if (a.target_type === 'class') return stu.class_code === a.target_value;
+            if (a.target_type === 'group') {
+              try { return JSON.parse(a.target_value||'[]').includes(studentId); } catch(e){ return false; }
+            }
+            if (a.target_type === 'individual') {
+              try { return JSON.parse(a.target_value||'[]').includes(studentId); } catch(e){ return false; }
+            }
+            return false;
+          });
+          sendJSON(res, filtered);
+        });
+      });
+    } else if (schoolCode && schoolCode === SCHOOL_CODE) {
+      supabase('GET', 'assignments?school_code=eq.'+encodeURIComponent(schoolCode)+'&order=created_at.desc', null, (err, data) => {
+        sendJSON(res, data||[]);
+      });
+    } else if (classCode) {
+      supabase('GET', 'assignments?class_code=eq.'+encodeURIComponent(classCode)+'&order=created_at.desc', null, (err, data) => {
+        sendJSON(res, data||[]);
+      });
+    } else {
+      sendJSON(res, { error: 'unauthorized' }, 403);
+    }
+    return;
+  }
+
+  // 課題作成
+  if (req.method === 'POST' && req.url === '/api/assignments') {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const assignment = {
+        id: 'a' + Date.now(),
+        title: body.title || '課題',
+        content: body.content || '',
+        teacher_id: body.teacher_id || '',
+        class_code: body.class_code || '',
+        school_code: SCHOOL_CODE,
+        target_type: body.target_type || 'class',
+        target_value: body.target_value || '',
+        due_date: body.due_date || null,
+      };
+      supabase('POST', 'assignments', assignment, (err, data) => {
+        sendJSON(res, { ok: true, assignment: Array.isArray(data)?data[0]:data });
+      });
+    });
+    return;
+  }
+
+  // 課題削除
+  if (req.method === 'DELETE' && req.url.startsWith('/api/assignments/')) {
+    const id = req.url.split('/')[3];
+    supabase('DELETE', 'assignments?id=eq.'+id, null, (err, data) => {
+      sendJSON(res, { ok: true });
+    });
+    return;
+  }
+
+  // グループ一覧取得
+  if (req.method === 'GET' && req.url.startsWith('/api/groups')) {
+    const params = new URL(req.url, 'http://x').searchParams;
+    const classCode = params.get('class_code');
+    supabase('GET', 'groups?class_code=eq.'+encodeURIComponent(classCode||'')+'&order=created_at.asc', null, (err, data) => {
+      sendJSON(res, data||[]);
+    });
+    return;
+  }
+
+  // グループ作成
+  if (req.method === 'POST' && req.url === '/api/groups') {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const group = {
+        id: 'g' + Date.now(),
+        name: body.name || 'グループ',
+        class_code: body.class_code || '',
+        school_code: SCHOOL_CODE,
+        student_ids: body.student_ids || [],
+      };
+      supabase('POST', 'groups', group, (err, data) => {
+        sendJSON(res, { ok: true, group: Array.isArray(data)?data[0]:data });
+      });
+    });
+    return;
+  }
+
+  // グループ更新
+  if (req.method === 'PUT' && req.url.startsWith('/api/groups/')) {
+    const id = req.url.split('/')[3];
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      supabase('PATCH', 'groups?id=eq.'+id, { name: body.name, student_ids: body.student_ids }, (err, data) => {
+        sendJSON(res, { ok: true });
+      });
+    });
+    return;
+  }
+
+  // グループ削除
+  if (req.method === 'DELETE' && req.url.startsWith('/api/groups/')) {
+    const id = req.url.split('/')[3];
+    supabase('DELETE', 'groups?id=eq.'+id, null, (err, data) => {
+      sendJSON(res, { ok: true });
+    });
+    return;
+  }
+
   // 先生コメント更新
   if (req.method === 'PUT' && req.url.startsWith('/api/reports/comment/')) {
     const rid = req.url.split('/')[4].split('?')[0];
