@@ -421,18 +421,25 @@ const server = http.createServer((req, res) => {
       supabase('GET', 'students?id=eq.'+studentId, null, (err, stuData) => {
         const stu = Array.isArray(stuData)&&stuData.length?stuData[0]:null;
         if (!stu) { sendJSON(res, []); return; }
-        supabase('GET', 'assignments?school_code=eq.'+encodeURIComponent(stu.school_code||schoolCode||'')+'&order=created_at.desc', null, (err, data) => {
+        // school_codeはSCHOOL_CODEを使う（studentsテーブルにはない）
+        supabase('GET', 'assignments?school_code=eq.'+encodeURIComponent(SCHOOL_CODE)+'&order=created_at.desc', null, (err, data) => {
           const all = Array.isArray(data)?data:[];
           // target_typeで絞り込み
           const filtered = all.filter(a => {
             if (a.target_type === 'school') return true;
-            if (a.target_type === 'grade') return stu.grade === a.target_value;
-            if (a.target_type === 'class') return stu.class_code === a.target_value;
-            if (a.target_type === 'group') {
-              try { return JSON.parse(a.target_value||'[]').includes(studentId); } catch(e){ return false; }
+            if (a.target_type === 'grade') {
+              // 学年一致チェック（「小4」=「小4」）
+              return stu.grade && stu.grade === a.target_value;
             }
-            if (a.target_type === 'individual') {
-              try { return JSON.parse(a.target_value||'[]').includes(studentId); } catch(e){ return false; }
+            if (a.target_type === 'class') {
+              // クラスコード一致チェック
+              return stu.class_code === a.target_value;
+            }
+            if (a.target_type === 'group' || a.target_type === 'individual') {
+              try {
+                const ids = JSON.parse(a.target_value||'[]');
+                return ids.includes(studentId);
+              } catch(e){ return false; }
             }
             return false;
           });
