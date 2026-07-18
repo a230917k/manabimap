@@ -540,6 +540,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 課題別提出レポート取得
+  if (req.method === 'GET' && req.url.startsWith('/api/reports/assignment/')) {
+    const aid = req.url.split('/')[4].split('?')[0];
+    supabase('GET', 'reports?assignment_id=eq.'+encodeURIComponent(aid)+'&order=date.desc', null, (err, data) => {
+      sendJSON(res, data || []);
+    });
+    return;
+  }
+
   // 先生コメント更新
   if (req.method === 'PUT' && req.url.startsWith('/api/reports/comment/')) {
     const rid = req.url.split('/')[4].split('?')[0];
