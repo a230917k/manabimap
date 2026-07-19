@@ -549,12 +549,16 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 先生コメント更新
+  // 先生コメント・点数・既読更新
   if (req.method === 'PUT' && req.url.startsWith('/api/reports/comment/')) {
     const rid = req.url.split('/')[4].split('?')[0];
     readBody(req, (err, body) => {
       if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
-      supabase('PATCH', 'reports?id=eq.'+rid, { teacher_comment: body.comment || '' }, (err, data) => {
+      const updates = {};
+      if (body.comment !== undefined) updates.teacher_comment = body.comment || '';
+      if (body.teacher_score !== undefined) updates.teacher_score = body.teacher_score;
+      if (body.read_by_teacher !== undefined) updates.read_by_teacher = body.read_by_teacher;
+      supabase('PATCH', 'reports?id=eq.'+rid, updates, (err, data) => {
         sendJSON(res, { ok: true });
       });
     });
