@@ -558,6 +558,7 @@ const server = http.createServer((req, res) => {
       if (body.comment !== undefined) updates.teacher_comment = body.comment || '';
       if (body.teacher_score !== undefined) updates.teacher_score = body.teacher_score;
       if (body.read_by_teacher !== undefined) updates.read_by_teacher = body.read_by_teacher;
+      if (body.teacher_adjustment !== undefined) updates.teacher_adjustment = body.teacher_adjustment;
       supabase('PATCH', 'reports?id=eq.'+rid, updates, (err, data) => {
         sendJSON(res, { ok: true });
       });
