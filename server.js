@@ -45,7 +45,7 @@ function supabase(method, path, body, callback) {
       'Content-Type': 'application/json',
     }
   };
-  if (method === 'POST') options.headers['Prefer'] = 'return=representation';
+  if (method === 'POST' || method === 'PATCH') options.headers['Prefer'] = 'return=representation';
   if (data) options.headers['Content-Length'] = Buffer.byteLength(data);
   const req = https.request(options, (res) => {
     let d = '';
