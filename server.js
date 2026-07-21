@@ -468,6 +468,8 @@ const server = http.createServer((req, res) => {
         id: 'a' + Date.now(),
         title: body.title || '課題',
         content: body.content || '',
+        goal: body.goal || '',
+        rubric: body.rubric || '',
         teacher_id: body.teacher_id || '',
         class_code: body.class_code || '',
         school_code: SCHOOL_CODE,
