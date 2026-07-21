@@ -382,6 +382,8 @@ const server = http.createServer((req, res) => {
         grade_auto: body.grade_auto !== false,
         result: body.result,
         unlocked: body.unlocked || {},
+        is_homework: body.is_homework || false,
+        assignment_id: body.assignment_id || '',
         date: body.date || new Date().toISOString()
       };
       supabase('POST', 'reports', report, (err, data) => {
