@@ -297,8 +297,17 @@ const server = http.createServer((req, res) => {
         null, (err, data) => {
           const student = Array.isArray(data) && data.length ? data[0] : null;
           if (!student) { sendJSON(res, { student: null }); return; }
-          // 名前またはふりがなで照合
-          const nameMatch = student.name === name || student.yomi === name;
+          // 名前照合（空白の全角/半角/なしを吸収）
+          function normalizeName(s) {
+            if (!s) return '';
+            return s
+              .replace(/　/g, '') // 全角スペース除去
+              .replace(/\s+/g, '')    // 半角スペース・空白除去
+              .toLowerCase();
+          }
+          const inputNorm = normalizeName(name);
+          const nameMatch = normalizeName(student.name) === inputNorm
+                         || normalizeName(student.yomi) === inputNorm;
           if (nameMatch) {
             sendJSON(res, { student });
           } else {
