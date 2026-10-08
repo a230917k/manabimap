@@ -24,6 +24,17 @@ function convertGrade(gradeStr) {
   return map[g] || g;
 }
 
+// ── 年度ユーティリティ（4月1日始まり）──────────────
+function currentYear(d) {
+  const t = d ? new Date(d) : new Date();
+  const m = t.getMonth() + 1; // 1-12
+  return m >= 4 ? t.getFullYear() : t.getFullYear() - 1;
+}
+function parseYear(v) {
+  const n = parseInt(v, 10);
+  return (!isNaN(n) && n >= 2000 && n <= 2100) ? n : currentYear();
+}
+
 function genAccountId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 紛らわしい文字を除外
   let id = '';
@@ -329,23 +340,137 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 全児童取得（先生・クラス別）
+  // 全児童取得（先生・クラス別）※年度の在籍で絞る
   if (req.method === 'GET' && req.url.startsWith('/api/students')) {
     const params = new URL(req.url, 'http://x').searchParams;
     const code = params.get('code');
     const schoolCode = params.get('school_code');
+    const year = parseYear(params.get('year'));
+
+    // 在籍（enrollments）と児童（students）を結合して返す
+    function withEnrollments(enrollPath, fallback) {
+      supabase('GET', enrollPath, null, (err, enrolls) => {
+        if (!Array.isArray(enrolls) || !enrolls.length) {
+          // 在籍データがない年度は空（ただし移行前の互換として fallback）
+          if (fallback) { fallback(); return; }
+          sendJSON(res, []); return;
+        }
+        supabase('GET', 'students?order=created_at.asc', null, (err2, studs) => {
+          const byId = {};
+          (studs || []).forEach(s => { byId[s.id] = s; });
+          const merged = enrolls.map(e => {
+            const s = byId[e.student_id];
+            if (!s) return null;
+            return Object.assign({}, s, {
+              class_code: e.class_code,
+              class_id:   e.class_id,
+              grade:      e.grade || s.grade || '',
+              seq:        (e.seq !== null && e.seq !== undefined) ? e.seq : s.seq,
+              role:       e.role || s.role || '',
+              year:       e.year
+            });
+          }).filter(Boolean);
+          sendJSON(res, merged);
+        });
+      });
+    }
+
     if (schoolCode && schoolCode === SCHOOL_CODE) {
-      // 学校全体の児童
-      supabase('GET', 'students?order=created_at.asc', null, (err, data) => {
-        sendJSON(res, data || []);
-      });
+      withEnrollments('enrollments?year=eq.'+year+'&order=seq.asc',
+        () => supabase('GET', 'students?order=created_at.asc', null, (e, d) => sendJSON(res, d || [])));
     } else if (code) {
-      supabase('GET', 'students?class_code=eq.'+encodeURIComponent(code)+'&order=created_at.asc', null, (err, data) => {
-        sendJSON(res, data || []);
-      });
+      withEnrollments('enrollments?year=eq.'+year+'&class_code=eq.'+encodeURIComponent(code)+'&order=seq.asc',
+        () => supabase('GET', 'students?class_code=eq.'+encodeURIComponent(code)+'&order=created_at.asc', null, (e, d) => sendJSON(res, d || [])));
     } else {
       sendJSON(res, { error: 'unauthorized' }, 403);
     }
+    return;
+  }
+
+  // ── 在籍・年度管理 ──────────────────────────────
+
+  // 利用可能な年度一覧
+  if (req.method === 'GET' && req.url.startsWith('/api/years')) {
+    supabase('GET', 'enrollments?select=year', null, (err, data) => {
+      const set = {};
+      (data || []).forEach(r => { if (r.year) set[r.year] = true; });
+      const years = Object.keys(set).map(Number).sort((a,b) => b - a);
+      if (!years.length) years.push(currentYear());
+      sendJSON(res, { years, current: currentYear() });
+    });
+    return;
+  }
+
+  // 進級処理（次年度の在籍を作る）
+  if (req.method === 'POST' && req.url === '/api/enrollments/promote') {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      if (body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const fromYear = parseYear(body.from_year);
+      const toYear   = parseYear(body.to_year);
+      // 学年を1つ進める
+      const nextGrade = (g) => {
+        const m = String(g || '').match(/^(小|中)(\d)$/);
+        if (!m) return g || '';
+        const kind = m[1], n = parseInt(m[2], 10);
+        if (kind === '小') return n < 6 ? '小' + (n + 1) : '中1';
+        return n < 3 ? '中' + (n + 1) : '';  // 中3は卒業
+      };
+      supabase('GET', 'enrollments?year=eq.'+fromYear, null, (err2, rows) => {
+        if (!Array.isArray(rows) || !rows.length) { sendJSON(res, { ok: true, created: 0 }); return; }
+        const targets = rows.map(r => ({ r, g: nextGrade(r.grade) })).filter(x => x.g); // 卒業者は除外
+        let done = 0, created = 0;
+        if (!targets.length) { sendJSON(res, { ok: true, created: 0, graduated: rows.length }); return; }
+        targets.forEach(({ r, g }) => {
+          const rec = {
+            id: 'e' + r.student_id + '_' + toYear,
+            student_id: r.student_id,
+            year: toYear,
+            class_code: r.class_code,   // クラスは名簿読み込みで上書きする前提
+            class_id: r.class_id,
+            grade: g,
+            seq: r.seq,
+            role: r.role || ''
+          };
+          supabase('POST', 'enrollments', rec, () => {
+            created++; done++;
+            if (done === targets.length) {
+              sendJSON(res, { ok: true, created, graduated: rows.length - targets.length });
+            }
+          });
+        });
+      });
+    });
+    return;
+  }
+
+  // 在籍の個別登録・更新（非常用の手入力）
+  if (req.method === 'POST' && req.url === '/api/enrollments') {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const year = parseYear(body.year);
+      const rec = {
+        id: 'e' + body.student_id + '_' + year,
+        student_id: body.student_id,
+        year: year,
+        class_code: body.class_code || '',
+        class_id: body.class_id || null,
+        grade: body.grade || '',
+        seq: body.seq || null,
+        role: body.role || ''
+      };
+      // 既存があれば更新、なければ作成
+      supabase('GET', 'enrollments?student_id=eq.'+encodeURIComponent(body.student_id)+'&year=eq.'+year, null, (e, rows) => {
+        if (Array.isArray(rows) && rows.length) {
+          supabase('PATCH', 'enrollments?id=eq.'+encodeURIComponent(rows[0].id), {
+            class_code: rec.class_code, class_id: rec.class_id,
+            grade: rec.grade, seq: rec.seq, role: rec.role
+          }, (e2, d) => sendJSON(res, { ok: true, updated: true }));
+        } else {
+          supabase('POST', 'enrollments', rec, (e2, d) => sendJSON(res, { ok: true, created: true }));
+        }
+      });
+    });
     return;
   }
 
@@ -384,7 +509,8 @@ const server = http.createServer((req, res) => {
         unlocked: body.unlocked || {},
         is_homework: body.is_homework || false,
         assignment_id: body.assignment_id || '',
-        date: body.date || new Date().toISOString()
+        date: body.date || new Date().toISOString(),
+        year: body.year || currentYear(body.date)
       };
       supabase('POST', 'reports', report, (err, data) => {
         sendJSON(res, { ok: true, report: Array.isArray(data) ? data[0] : data });
@@ -396,7 +522,12 @@ const server = http.createServer((req, res) => {
   // レポート取得（児童別）
   if (req.method === 'GET' && req.url.startsWith('/api/reports/student/')) {
     const studentId = req.url.split('/')[4].split('?')[0];
-    supabase('GET', 'reports?student_id=eq.'+studentId+'&order=date.desc', null, (err, data) => {
+    const yParam = new URL(req.url, 'http://x').searchParams.get('year');
+    // year=all なら全年度（累積）、未指定も全年度を返しフロントで絞る
+    let path = 'reports?student_id=eq.'+studentId;
+    if (yParam && yParam !== 'all') path += '&year=eq.'+parseYear(yParam);
+    path += '&order=date.desc';
+    supabase('GET', path, null, (err, data) => {
       sendJSON(res, data || []);
     });
     return;
@@ -407,12 +538,14 @@ const server = http.createServer((req, res) => {
     const params = new URL(req.url, 'http://x').searchParams;
     const code = params.get('code');
     const schoolCode = params.get('school_code');
+    const yParam = params.get('year');
+    const yFilter = (yParam && yParam !== 'all') ? '&year=eq.'+parseYear(yParam) : '';
     if (schoolCode && schoolCode === SCHOOL_CODE) {
-      supabase('GET', 'reports?order=date.desc', null, (err, data) => {
+      supabase('GET', 'reports?order=date.desc'+yFilter, null, (err, data) => {
         sendJSON(res, data || []);
       });
     } else if (code) {
-      supabase('GET', 'reports?class_code=eq.'+encodeURIComponent(code)+'&order=date.desc', null, (err, data) => {
+      supabase('GET', 'reports?class_code=eq.'+encodeURIComponent(code)+yFilter+'&order=date.desc', null, (err, data) => {
         sendJSON(res, data || []);
       });
     } else {
@@ -584,7 +717,8 @@ const server = http.createServer((req, res) => {
     readBody(req, (err, body) => {
       if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
       const records = body.records || [];
-      let created = { classes: 0, students: 0, teachers: 0 };
+      const importYear = parseYear(body.year);
+      let created = { classes: 0, students: 0, teachers: 0, enrollments: 0 };
       let pending = records.length;
       if (!pending) { sendJSON(res, { ok: true, created }); return; }
 
@@ -603,27 +737,72 @@ const server = http.createServer((req, res) => {
           supabase('POST', 'classes', cls, (e, d) => { created.classes++; done(); });
         } else if (r.type === 'student' || r.type === '児童') {
           const grade = convertGrade(r.grade);
-          const stu = {
-            id: 's' + Date.now() + Math.random().toString(36).slice(2,5),
-            account_id: r.account_id || genAccountId(),
-            name: r.name,
-            yomi: r.yomi || '',
-            role: r.role || '',
-            seq: r.seq ? parseInt(r.seq) : null,
-            grade: grade,
-            grade_lock: grade ? true : false,
-            class_code: r.class_code || '',
-            class_id: r.class_id || null,
+          const seqVal = r.seq ? parseInt(r.seq) : null;
+
+          // 在籍レコードを作る（既存なら更新）
+          const upsertEnrollment = (studentId, classId, isNew) => {
+            const rec = {
+              id: 'e' + studentId + '_' + importYear,
+              student_id: studentId,
+              year: importYear,
+              class_code: r.class_code || '',
+              class_id: classId || null,
+              grade: grade,
+              seq: seqVal,
+              role: r.role || ''
+            };
+            supabase('GET', 'enrollments?student_id=eq.'+encodeURIComponent(studentId)+'&year=eq.'+importYear, null, (e, rows) => {
+              if (Array.isArray(rows) && rows.length) {
+                supabase('PATCH', 'enrollments?id=eq.'+encodeURIComponent(rows[0].id), {
+                  class_code: rec.class_code, class_id: rec.class_id,
+                  grade: rec.grade, seq: rec.seq, role: rec.role
+                }, () => { if (isNew) created.students++; else created.enrollments++; done(); });
+              } else {
+                supabase('POST', 'enrollments', rec, () => { if (isNew) created.students++; else created.enrollments++; done(); });
+              }
+            });
           };
-          // classesからclass_idを取得
+
+          const proceed = (classId) => {
+            // 既存児童を account_id で照合（なければ氏名）
+            const findPath = r.account_id
+              ? 'students?account_id=eq.'+encodeURIComponent(r.account_id)
+              : 'students?name=eq.'+encodeURIComponent(r.name);
+            supabase('GET', findPath, null, (e, found) => {
+              if (Array.isArray(found) && found.length) {
+                // 既存児童 → 在籍だけ更新（進級・クラス替え）
+                const sid = found[0].id;
+                supabase('PATCH', 'students?id=eq.'+sid, {
+                  grade: grade, grade_lock: grade ? true : false,
+                  class_code: r.class_code || '', class_id: classId || null,
+                  seq: seqVal, role: r.role || ''
+                }, () => upsertEnrollment(sid, classId, false));
+              } else {
+                const sid = 's' + Date.now() + Math.random().toString(36).slice(2,5);
+                const stu = {
+                  id: sid,
+                  account_id: r.account_id || genAccountId(),
+                  name: r.name,
+                  yomi: r.yomi || '',
+                  role: r.role || '',
+                  seq: seqVal,
+                  grade: grade,
+                  grade_lock: grade ? true : false,
+                  class_code: r.class_code || '',
+                  class_id: classId || null,
+                };
+                supabase('POST', 'students', stu, () => upsertEnrollment(sid, classId, true));
+              }
+            });
+          };
+
           if (r.class_code) {
             supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(r.class_code), null, (e, clsData) => {
               const cls = Array.isArray(clsData) && clsData.length ? clsData[0] : null;
-              if (cls) stu.class_id = cls.id;
-              supabase('POST', 'students', stu, (e2, d) => { created.students++; done(); });
+              proceed(cls ? cls.id : null);
             });
           } else {
-            supabase('POST', 'students', stu, (e, d) => { created.students++; done(); });
+            proceed(null);
           }
         } else if (r.type === 'teacher' || r.type === '先生') {
           const teacher = {
