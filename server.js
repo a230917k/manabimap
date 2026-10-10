@@ -35,6 +35,35 @@ function parseYear(v) {
   return (!isNaN(n) && n >= 2000 && n <= 2100) ? n : currentYear();
 }
 
+// ── お知らせ ────────────────────────────────────
+function createNotification(n, cb) {
+  const rec = {
+    id: 'n' + Date.now() + Math.random().toString(36).slice(2, 6),
+    kind: n.kind || 'system',
+    title: n.title || '',
+    body: n.body || '',
+    audience: n.audience || 'admin',
+    audience_key: n.audience_key || '',
+    school_code: SCHOOL_CODE,
+    actor_name: n.actor_name || '',
+    target_name: n.target_name || '',
+    before_value: n.before_value || '',
+    after_value: n.after_value || '',
+    link_type: n.link_type || '',
+    link_id: n.link_id || '',
+    created_at: new Date().toISOString()
+  };
+  supabase('POST', 'notifications', rec, (e, d) => { if (cb) cb(e, d); });
+}
+
+// 設定値の取得
+function getSetting(key, fallback, cb) {
+  supabase('GET', 'school_settings?key=eq.' + encodeURIComponent(key), null, (e, rows) => {
+    if (Array.isArray(rows) && rows.length && rows[0].value) cb(rows[0].value);
+    else cb(fallback);
+  });
+}
+
 function genAccountId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 紛らわしい文字を除外
   let id = '';
@@ -483,14 +512,190 @@ const server = http.createServer((req, res) => {
 
   // 児童情報更新
   if (req.method === 'PUT' && req.url.startsWith('/api/students/')) {
-    const id = req.url.split('/')[3];
+    const id = req.url.split('/')[3].split('?')[0];
     readBody(req, (err, body) => {
       if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
-      const updates = {};
-      if (body.grade !== undefined) updates.grade = body.grade;
-      if (body.grade_lock !== undefined) updates.grade_lock = body.grade_lock;
-      supabase('PATCH', 'students?id=eq.'+id, updates, (err, data) => {
-        sendJSON(res, { ok: true });
+      const byAdmin = body.school_code === SCHOOL_CODE;
+
+      // 変更前の値を取っておく（通知の履歴に使う）
+      supabase('GET', 'students?id=eq.'+id, null, (e0, before) => {
+        const prev = (Array.isArray(before) && before.length) ? before[0] : {};
+        const updates = {};
+        const changes = [];   // {label, from, to}
+
+        // 先生が変更できる項目
+        if (body.name !== undefined && body.name !== prev.name) {
+          updates.name = body.name;
+          changes.push({ label: '氏名', from: prev.name || '', to: body.name });
+        }
+        if (body.yomi !== undefined && body.yomi !== prev.yomi) {
+          updates.yomi = body.yomi;
+          changes.push({ label: 'ふりがな', from: prev.yomi || '', to: body.yomi });
+        }
+        if (body.seq !== undefined && String(body.seq) !== String(prev.seq)) {
+          updates.seq = body.seq;
+          changes.push({ label: '出席番号', from: String(prev.seq || ''), to: String(body.seq || '') });
+        }
+
+        // 管理者のみ変更できる項目
+        if (byAdmin) {
+          if (body.account_id !== undefined && body.account_id !== prev.account_id) {
+            updates.account_id = body.account_id;
+            changes.push({ label: 'アカウントID', from: prev.account_id || '', to: body.account_id });
+          }
+          if (body.class_code !== undefined && body.class_code !== prev.class_code) {
+            updates.class_code = body.class_code;
+            changes.push({ label: 'クラス', from: prev.class_code || '', to: body.class_code });
+          }
+          if (body.grade !== undefined && body.grade !== prev.grade) {
+            updates.grade = body.grade;
+            changes.push({ label: '学年', from: prev.grade || '', to: body.grade });
+          }
+          if (body.grade_lock !== undefined) updates.grade_lock = body.grade_lock;
+        } else {
+          // 先生からの grade 変更は従来どおり許可（学年設定機能のため）
+          if (body.grade !== undefined && body.grade !== prev.grade) {
+            updates.grade = body.grade;
+            changes.push({ label: '学年', from: prev.grade || '', to: body.grade });
+          }
+          if (body.grade_lock !== undefined) updates.grade_lock = body.grade_lock;
+          // account_id / class_code は無視する
+        }
+
+        if (!Object.keys(updates).length) { sendJSON(res, { ok: true, changed: 0 }); return; }
+
+        supabase('PATCH', 'students?id=eq.'+id, updates, (err2) => {
+          // 在籍側にも出席番号・学年を反映
+          if (updates.seq !== undefined || updates.grade !== undefined) {
+            const y = parseYear(body.year);
+            supabase('GET', 'enrollments?student_id=eq.'+encodeURIComponent(id)+'&year=eq.'+y, null, (e3, rows) => {
+              if (Array.isArray(rows) && rows.length) {
+                const u2 = {};
+                if (updates.seq !== undefined) u2.seq = updates.seq;
+                if (updates.grade !== undefined) u2.grade = updates.grade;
+                supabase('PATCH', 'enrollments?id=eq.'+encodeURIComponent(rows[0].id), u2, () => {});
+              }
+            });
+          }
+
+          // 氏名・ふりがな・出席番号が変わったら管理者へ通知
+          const notable = changes.filter(x => ['氏名','ふりがな','出席番号','アカウントID','クラス'].indexOf(x.label) >= 0);
+          if (!notable.length) { sendJSON(res, { ok: true, changed: changes.length }); return; }
+
+          getSetting('student_edit_audience', 'admin', (aud) => {
+            const name = updates.name || prev.name || '児童';
+            const detail = notable.map(x => x.label + '「' + (x.from || '（空）') + '」→「' + (x.to || '（空）') + '」').join('\n');
+            const base = {
+              kind: 'student_edit',
+              title: name + 'さんの情報が変更されました',
+              body: detail,
+              actor_name: body.actor_name || '先生',
+              target_name: name,
+              before_value: notable.map(x => x.label + ':' + (x.from || '')).join(' / '),
+              after_value:  notable.map(x => x.label + ':' + (x.to   || '')).join(' / '),
+              link_type: 'student',
+              link_id: id
+            };
+            // 管理者には必ず届ける
+            createNotification(Object.assign({}, base, { audience: 'admin' }), () => {});
+            if (aud === 'grade' && (updates.grade || prev.grade)) {
+              createNotification(Object.assign({}, base, { audience: 'grade', audience_key: updates.grade || prev.grade }), () => {});
+            } else if (aud === 'teachers') {
+              createNotification(Object.assign({}, base, { audience: 'teachers' }), () => {});
+            }
+            sendJSON(res, { ok: true, changed: changes.length });
+          });
+        });
+      });
+    });
+    return;
+  }
+
+  // ── お知らせ API ───────────────────────────────
+
+  // 自分あてのお知らせ一覧
+  if (req.method === 'GET' && req.url.startsWith('/api/notifications')) {
+    const p = new URL(req.url, 'http://x').searchParams;
+    const role      = p.get('role') || 'student';   // admin / teacher / student
+    const readerId  = p.get('reader_id') || '';
+    const grade     = p.get('grade') || '';
+    const classCode = p.get('code') || '';
+
+    supabase('GET', 'notifications?order=created_at.desc&limit=100', null, (e, rows) => {
+      const all = Array.isArray(rows) ? rows : [];
+      const mine = all.filter(n => {
+        if (role === 'admin')   return n.audience === 'admin' || n.audience === 'teachers';
+        if (role === 'teacher') {
+          if (n.audience === 'teachers') return true;
+          if (n.audience === 'grade')    return n.audience_key === grade;
+          if (n.audience === 'class')    return n.audience_key === classCode;
+          return false;
+        }
+        // 児童
+        if (n.audience === 'student') return n.audience_key === readerId;
+        if (n.audience === 'class')   return n.audience_key === classCode;
+        return false;
+      });
+      if (!mine.length) { sendJSON(res, { items: [], unread: 0 }); return; }
+      supabase('GET', 'notification_reads?reader_id=eq.'+encodeURIComponent(readerId), null, (e2, reads) => {
+        const readSet = {};
+        (Array.isArray(reads) ? reads : []).forEach(r => { readSet[r.notif_id] = true; });
+        const items = mine.map(n => Object.assign({}, n, { is_read: !!readSet[n.id] }));
+        sendJSON(res, { items, unread: items.filter(x => !x.is_read).length });
+      });
+    });
+    return;
+  }
+
+  // 既読にする
+  if (req.method === 'POST' && req.url === '/api/notifications/read') {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const readerId = body.reader_id || '';
+      const ids = Array.isArray(body.notif_ids) ? body.notif_ids : (body.notif_id ? [body.notif_id] : []);
+      if (!readerId || !ids.length) { sendJSON(res, { ok: true, marked: 0 }); return; }
+      let done = 0;
+      ids.forEach(nid => {
+        supabase('POST', 'notification_reads', {
+          id: nid + '__' + readerId, notif_id: nid, reader_id: readerId,
+          read_at: new Date().toISOString()
+        }, () => { done++; if (done === ids.length) sendJSON(res, { ok: true, marked: ids.length }); });
+      });
+    });
+    return;
+  }
+
+  // お知らせを作る（コメント・課題配信などから呼ぶ）
+  if (req.method === 'POST' && req.url === '/api/notifications') {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      createNotification(body, () => sendJSON(res, { ok: true }));
+    });
+    return;
+  }
+
+  // 学校設定の取得・更新
+  if (req.method === 'GET' && req.url.startsWith('/api/settings')) {
+    supabase('GET', 'school_settings', null, (e, rows) => {
+      const out = {};
+      (Array.isArray(rows) ? rows : []).forEach(r => { out[r.key] = r.value; });
+      sendJSON(res, out);
+    });
+    return;
+  }
+  if (req.method === 'PUT' && req.url.startsWith('/api/settings')) {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      if (body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const key = body.key, value = body.value || '';
+      if (!key) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      supabase('GET', 'school_settings?key=eq.'+encodeURIComponent(key), null, (e, rows) => {
+        if (Array.isArray(rows) && rows.length) {
+          supabase('PATCH', 'school_settings?key=eq.'+encodeURIComponent(key),
+            { value: value, updated_at: new Date().toISOString() }, () => sendJSON(res, { ok: true }));
+        } else {
+          supabase('POST', 'school_settings', { key: key, value: value }, () => sendJSON(res, { ok: true }));
+        }
       });
     });
     return;
@@ -629,7 +834,40 @@ const server = http.createServer((req, res) => {
         due_date: body.due_date || null,
       };
       supabase('POST', 'assignments', assignment, (err, data) => {
-        sendJSON(res, { ok: true, assignment: Array.isArray(data)?data[0]:data });
+        // 配信先の児童へお知らせ
+        const notif = {
+          kind: 'assignment',
+          title: '新しい課題がとどきました',
+          body: assignment.title,
+          actor_name: body.actor_name || '先生',
+          link_type: 'assignment',
+          link_id: assignment.id
+        };
+        const tt = assignment.target_type, tv = assignment.target_value;
+        if (tt === 'student' && tv) {
+          // 個人指定（カンマ区切りの児童ID）
+          String(tv).split(',').map(s => s.trim()).filter(Boolean).forEach(sid => {
+            createNotification(Object.assign({}, notif, { audience: 'student', audience_key: sid }), () => {});
+          });
+          sendJSON(res, { ok: true, assignment: Array.isArray(data)?data[0]:data });
+        } else if (tt === 'class' || !tt) {
+          createNotification(Object.assign({}, notif, {
+            audience: 'class', audience_key: assignment.class_code
+          }), () => sendJSON(res, { ok: true, assignment: Array.isArray(data)?data[0]:data }));
+        } else {
+          // 学年・グループ・学校全体は該当児童へ個別に配る
+          let path = 'enrollments?year=eq.' + currentYear();
+          if (tt === 'grade' && tv) path += '&grade=eq.' + encodeURIComponent(tv);
+          supabase('GET', path, null, (e2, enrolls) => {
+            const list = Array.isArray(enrolls) ? enrolls : [];
+            list.forEach(en => {
+              createNotification(Object.assign({}, notif, {
+                audience: 'student', audience_key: en.student_id
+              }), () => {});
+            });
+            sendJSON(res, { ok: true, assignment: Array.isArray(data)?data[0]:data });
+          });
+        }
       });
     });
     return;
@@ -713,7 +951,26 @@ const server = http.createServer((req, res) => {
       if (body.read_by_teacher !== undefined) updates.read_by_teacher = body.read_by_teacher;
       if (body.teacher_adjustment !== undefined) updates.teacher_adjustment = body.teacher_adjustment;
       supabase('PATCH', 'reports?id=eq.'+rid, updates, (err, data) => {
-        sendJSON(res, { ok: true });
+        // コメントや点数がついたら児童本人へお知らせ
+        const hasFeedback = (body.comment !== undefined && body.comment) || body.teacher_score !== undefined;
+        if (!hasFeedback) { sendJSON(res, { ok: true }); return; }
+        supabase('GET', 'reports?id=eq.'+rid, null, (e2, rows) => {
+          const rep = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+          if (!rep || !rep.student_id) { sendJSON(res, { ok: true }); return; }
+          const bits = [];
+          if (body.teacher_score !== undefined && body.teacher_score !== null) bits.push('点数: ' + body.teacher_score + '点');
+          if (body.comment) bits.push(body.comment);
+          createNotification({
+            kind: 'comment',
+            title: '先生からコメントがとどきました',
+            body: bits.join('\n'),
+            audience: 'student',
+            audience_key: rep.student_id,
+            actor_name: body.actor_name || '先生',
+            link_type: 'report',
+            link_id: rid
+          }, () => sendJSON(res, { ok: true }));
+        });
       });
     });
     return;
