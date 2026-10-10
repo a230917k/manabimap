@@ -59,9 +59,12 @@ function supabase(method, path, body, callback) {
   if (method === 'POST' || method === 'PATCH') options.headers['Prefer'] = 'return=representation';
   if (data) options.headers['Content-Length'] = Buffer.byteLength(data);
   const req = https.request(options, (res) => {
-    let d = '';
-    res.on('data', chunk => d += chunk);
+    // バイト列のまま貯め、受信完了後に一度だけ UTF-8 へ変換する。
+    // チャンクの境目で日本語や絵文字が分断されるのを防ぐため。
+    const chunks = [];
+    res.on('data', chunk => chunks.push(chunk));
     res.on('end', () => {
+      const d = Buffer.concat(chunks).toString('utf8');
       try { callback(null, JSON.parse(d || '[]'), res.statusCode); }
       catch(e) { callback(null, d, res.statusCode); }
     });
@@ -72,14 +75,18 @@ function supabase(method, path, body, callback) {
 }
 
 function sendJSON(res, data, status) {
-  res.writeHead(status || 200, { 'Content-Type': 'application/json' });
+  // charset を明示しないとブラウザ側の推測で化けることがある
+  res.writeHead(status || 200, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(data));
 }
 
 function readBody(req, callback) {
-  let body = '';
-  req.on('data', chunk => { body += chunk.toString(); });
+  // chunk.toString() を逐次呼ぶと、マルチバイト文字が
+  // チャンク境界で壊れる。Buffer のまま連結してから変換する。
+  const chunks = [];
+  req.on('data', chunk => { chunks.push(chunk); });
   req.on('end', () => {
+    const body = Buffer.concat(chunks).toString('utf8');
     try { callback(null, JSON.parse(body)); }
     catch(e) { callback(e); }
   });
@@ -853,15 +860,23 @@ const server = http.createServer((req, res) => {
         }
       };
       const apiReq = https.request(options, (apiRes) => {
-        let data = '';
-        apiRes.on('data', chunk => data += chunk);
+        // 絵文字などの4バイト文字がチャンク境界で割れないよう
+        // Buffer で受けてから一括で UTF-8 変換する
+        const chunks = [];
+        apiRes.on('data', chunk => chunks.push(chunk));
         apiRes.on('end', () => {
+          const data = Buffer.concat(chunks).toString('utf8');
           try {
             const parsed = JSON.parse(data);
             let content = parsed.choices?.[0]?.message?.content || '';
             if (!raw) content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-            // サロゲートペア・置換文字のみ除去（絵文字は残す）
-            content = content.replace(/\uFFFD/g, '').replace(/[\uD800-\uDFFF]/g, '');
+            // 壊れた文字だけを除去する。
+            // 正しいサロゲートペア（絵文字）は残し、対になっていない
+            // 単独サロゲートと置換文字だけを捨てる。
+            content = content
+              .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')  // 対のない上位
+              .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')  // 対のない下位
+              .replace(/\uFFFD/g, '');                                // 置換文字
             sendJSON(res, { content });
           } catch(e) { sendJSON(res, { error: 'parse error' }, 500); }
         });
