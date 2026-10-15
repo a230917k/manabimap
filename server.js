@@ -1159,7 +1159,8 @@ const server = http.createServer((req, res) => {
         temperature: 0.3,
         // 2〜3教科分のフィードバックが入るため余裕をもたせる。
         // 足りないと途中で切れて JSON が壊れる。
-        max_tokens: json ? 1200 : (raw ? 600 : 4000),
+        // json は短い辞書しか返さないので小さめでよい
+        max_tokens: json ? 1000 : (raw ? 600 : 4000),
         stream: false
       });
       const options = {
