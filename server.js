@@ -1139,10 +1139,14 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/api/analyze') {
     readBody(req, (err, body) => {
       if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
-      const { prompt, raw, image, mediaType } = body;
-      const systemPrompt = raw
-        ? 'あなたは教育の専門家です。指示された内容を日本語で答えてください。JSONは不要です。'
-        : 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。curriculum_referenceは簡潔な1文のみ。';
+      const { prompt, raw, json, image, mediaType } = body;
+      // json:true … 短いJSONを求めるとき（ふりがな辞書など）
+      // raw:true  … 普通の文章で答えてほしいとき
+      const systemPrompt = json
+        ? 'あなたは日本語の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロックは不要です。'
+        : (raw
+          ? 'あなたは教育の専門家です。指示された内容を日本語で答えてください。JSONは不要です。'
+          : 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。curriculum_referenceは簡潔な1文のみ。');
       let userContent = image
         ? [{ type: 'image_url', image_url: { url: `data:${mediaType||'image/jpeg'};base64,${image}` } }, { type: 'text', text: prompt }]
         : prompt;
@@ -1155,7 +1159,7 @@ const server = http.createServer((req, res) => {
         temperature: 0.3,
         // 2〜3教科分のフィードバックが入るため余裕をもたせる。
         // 足りないと途中で切れて JSON が壊れる。
-        max_tokens: raw ? 600 : 4000,
+        max_tokens: json ? 1200 : (raw ? 600 : 4000),
         stream: false
       });
       const options = {
