@@ -611,6 +611,41 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 動作確認用：AI への疎通を1回だけ試す
+  if (req.method === 'GET' && req.url.startsWith('/api/ai-check')) {
+    const post = JSON.stringify({
+      model: process.env.AI_MODEL || 'openrouter/auto',
+      messages: [{ role: 'user', content: '「OK」とだけ返してください。' }],
+      max_tokens: 20
+    });
+    const r = https.request({
+      hostname: 'openrouter.ai', path: '/api/v1/chat/completions', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+        'HTTP-Referer': 'https://manabimap.onrender.com',
+        'X-Title': 'ManabiMap',
+        'Content-Length': Buffer.byteLength(post)
+      }
+    }, (ar) => {
+      const ch = [];
+      ar.on('data', c2 => ch.push(c2));
+      ar.on('end', () => {
+        const body = Buffer.concat(ch).toString('utf8');
+        sendJSON(res, {
+          http_status: ar.statusCode,
+          model: process.env.AI_MODEL || 'openrouter/auto',
+          api_key_set: !!OPENROUTER_API_KEY,
+          api_key_head: OPENROUTER_API_KEY ? OPENROUTER_API_KEY.slice(0, 8) + '…' : '(未設定)',
+          response: body.slice(0, 600)
+        });
+      });
+    });
+    r.on('error', e => sendJSON(res, { error: e.message, api_key_set: !!OPENROUTER_API_KEY }, 500));
+    r.write(post); r.end();
+    return;
+  }
+
   // ── お知らせ API ───────────────────────────────
 
   // 自分あてのお知らせ一覧
@@ -1112,7 +1147,9 @@ const server = http.createServer((req, res) => {
         ? [{ type: 'image_url', image_url: { url: `data:${mediaType||'image/jpeg'};base64,${image}` } }, { type: 'text', text: prompt }]
         : prompt;
       // 応答の速いモデルを既定にする。Render の環境変数 AI_MODEL で変更できる。
-      const modelName = process.env.AI_MODEL || 'google/gemini-2.0-flash-001';
+      // 既定は openrouter/auto（以前から動作実績のある設定）。
+      // 速いモデルに固定したいときは Render の環境変数 AI_MODEL で指定する。
+      const modelName = process.env.AI_MODEL || 'openrouter/auto';
       const postData = JSON.stringify({
         model: modelName,
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
@@ -1140,11 +1177,21 @@ const server = http.createServer((req, res) => {
         apiRes.on('end', () => {
           const data = Buffer.concat(chunks).toString('utf8');
           try {
+            // HTTP ステータスが異常ならそのまま伝える
+            if (apiRes.statusCode >= 400) {
+              console.error('[AI] HTTP ' + apiRes.statusCode + ' body=' + data.slice(0, 500));
+              let m = 'AI接続エラー (HTTP ' + apiRes.statusCode + ')';
+              try { const p = JSON.parse(data); if (p.error && p.error.message) m = p.error.message; } catch(e2) {}
+              sendJSON(res, { error: m, content: '' }, 502);
+              return;
+            }
             const parsed = JSON.parse(data);
             // OpenRouter 側のエラーをそのまま伝える（空応答の原因を隠さない）
             if (parsed.error) {
               console.error('[AI] provider error:', JSON.stringify(parsed.error).slice(0, 400));
-              sendJSON(res, { error: (parsed.error.message || 'AI provider error'), content: '' }, 502);
+              const em = (typeof parsed.error === 'string') ? parsed.error
+                       : (parsed.error.message || JSON.stringify(parsed.error).slice(0, 200));
+              sendJSON(res, { error: em, content: '' }, 502);
               return;
             }
             let content = parsed.choices?.[0]?.message?.content || '';
@@ -1169,7 +1216,10 @@ const server = http.createServer((req, res) => {
               .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')  // 対のない下位
               .replace(/\uFFFD/g, '');                                // 置換文字
             sendJSON(res, { content });
-          } catch(e) { sendJSON(res, { error: 'parse error' }, 500); }
+          } catch(e) {
+            console.error('[AI] parse error:', e.message, 'body=' + String(data).slice(0, 500));
+            sendJSON(res, { error: 'AI応答の解析に失敗しました: ' + e.message, content: '' }, 500);
+          }
         });
       });
       apiReq.on('error', e => sendJSON(res, { error: e.message }, 500));
