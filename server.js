@@ -1141,7 +1141,25 @@ const server = http.createServer((req, res) => {
           const data = Buffer.concat(chunks).toString('utf8');
           try {
             const parsed = JSON.parse(data);
+            // OpenRouter 側のエラーをそのまま伝える（空応答の原因を隠さない）
+            if (parsed.error) {
+              console.error('[AI] provider error:', JSON.stringify(parsed.error).slice(0, 400));
+              sendJSON(res, { error: (parsed.error.message || 'AI provider error'), content: '' }, 502);
+              return;
+            }
             let content = parsed.choices?.[0]?.message?.content || '';
+            if (!content) {
+              const fin = parsed.choices?.[0]?.finish_reason || '';
+              console.error('[AI] empty content. model=' + (parsed.model || '?') + ' finish=' + fin
+                            + ' body=' + data.slice(0, 400));
+              sendJSON(res, {
+                error: fin === 'length'
+                  ? '応答が長すぎて途中で切れました'
+                  : 'AIから空の応答が返りました（model: ' + (parsed.model || '不明') + '）',
+                content: ''
+              }, 502);
+              return;
+            }
             if (!raw) content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
             // 壊れた文字だけを除去する。
             // 正しいサロゲートペア（絵文字）は残し、対になっていない
