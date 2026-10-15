@@ -745,6 +745,16 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // レポート1件の写真だけを取る（詳細を開いたときに使う）
+  if (req.method === 'GET' && req.url.startsWith('/api/reports/photo/')) {
+    const rid = req.url.split('/')[4].split('?')[0];
+    supabase('GET', 'reports?select=photo&id=eq.'+encodeURIComponent(rid), null, (err, rows) => {
+      const photo = (Array.isArray(rows) && rows.length) ? rows[0].photo : null;
+      sendJSON(res, { photo: photo || null });
+    });
+    return;
+  }
+
   // レポート取得（クラス別・先生用）
   if (req.method === 'GET' && req.url.startsWith('/api/reports/all')) {
     const params = new URL(req.url, 'http://x').searchParams;
@@ -752,12 +762,14 @@ const server = http.createServer((req, res) => {
     const schoolCode = params.get('school_code');
     const yParam = params.get('year');
     const yFilter = (yParam && yParam !== 'all') ? '&year=eq.'+parseYear(yParam) : '';
+    // 一覧では写真（base64）を返さない。転送量が大きく表示が遅くなるため。
+    const cols = 'select=id,student_id,class_code,class_id,title,text,grade,grade_auto,result,unlocked,is_homework,assignment_id,teacher_comment,teacher_score,read_by_teacher,teacher_adjustment,date,year';
     if (schoolCode && schoolCode === SCHOOL_CODE) {
-      supabase('GET', 'reports?order=date.desc'+yFilter, null, (err, data) => {
+      supabase('GET', 'reports?'+cols+'&order=date.desc'+yFilter, null, (err, data) => {
         sendJSON(res, data || []);
       });
     } else if (code) {
-      supabase('GET', 'reports?class_code=eq.'+encodeURIComponent(code)+yFilter+'&order=date.desc', null, (err, data) => {
+      supabase('GET', 'reports?'+cols+'&class_code=eq.'+encodeURIComponent(code)+yFilter+'&order=date.desc', null, (err, data) => {
         sendJSON(res, data || []);
       });
     } else {
@@ -1095,14 +1107,18 @@ const server = http.createServer((req, res) => {
       const { prompt, raw, image, mediaType } = body;
       const systemPrompt = raw
         ? 'あなたは教育の専門家です。指示された内容を日本語で答えてください。JSONは不要です。'
-        : 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。curriculum_referenceは簡潔な1文のみ。feedbackとoverall_commentには絵文字を使ってよいですが、サロゲートペアになる文字（壊れて表示される文字）は使わないこと。小学1〜3年生の場合はfeedbackとoverall_commentの漢字にHTMLのrubyタグでふりがなを振ること（例：<ruby>学習<rt>がくしゅう</rt></ruby>）。小学4〜6年生は難しい漢字のみrubyタグ。中学生以上はrubyタグ不要。';
+        : 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。curriculum_referenceは簡潔な1文のみ。';
       let userContent = image
         ? [{ type: 'image_url', image_url: { url: `data:${mediaType||'image/jpeg'};base64,${image}` } }, { type: 'text', text: prompt }]
         : prompt;
+      // 応答の速いモデルを既定にする。Render の環境変数 AI_MODEL で変更できる。
+      const modelName = process.env.AI_MODEL || 'google/gemini-2.0-flash-001';
       const postData = JSON.stringify({
-        model: 'openrouter/auto',
+        model: modelName,
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
-        temperature: 0.3, stream: false
+        temperature: 0.3,
+        max_tokens: raw ? 400 : 2000,   // 上限を切って生成時間を抑える
+        stream: false
       });
       const options = {
         hostname: 'openrouter.ai',
