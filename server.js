@@ -1146,15 +1146,16 @@ const server = http.createServer((req, res) => {
       let userContent = image
         ? [{ type: 'image_url', image_url: { url: `data:${mediaType||'image/jpeg'};base64,${image}` } }, { type: 'text', text: prompt }]
         : prompt;
-      // 応答の速いモデルを既定にする。Render の環境変数 AI_MODEL で変更できる。
-      // 既定は openrouter/auto（以前から動作実績のある設定）。
-      // 速いモデルに固定したいときは Render の環境変数 AI_MODEL で指定する。
+      // 既定は openrouter/auto。速いモデルに固定したいときは
+      // Render の環境変数 AI_MODEL で指定する。
       const modelName = process.env.AI_MODEL || 'openrouter/auto';
       const postData = JSON.stringify({
         model: modelName,
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
         temperature: 0.3,
-        max_tokens: raw ? 400 : 2000,   // 上限を切って生成時間を抑える
+        // 2〜3教科分のフィードバックが入るため余裕をもたせる。
+        // 足りないと途中で切れて JSON が壊れる。
+        max_tokens: raw ? 600 : 4000,
         stream: false
       });
       const options = {
@@ -1206,6 +1207,10 @@ const server = http.createServer((req, res) => {
                 content: ''
               }, 502);
               return;
+            }
+            // 途中で切れていても本文があれば返す。フロント側で拾える分だけ復元する。
+            if (parsed.choices?.[0]?.finish_reason === 'length') {
+              console.warn('[AI] truncated. model=' + (parsed.model || '?') + ' len=' + content.length);
             }
             if (!raw) content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
             // 壊れた文字だけを除去する。
