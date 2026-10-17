@@ -179,6 +179,97 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // クラスの中身を数える（削除前の確認に使う）
+  if (req.method === 'GET' && req.url.startsWith('/api/classes/summary/')) {
+    const code = decodeURIComponent(req.url.split('/')[4].split('?')[0]);
+    supabase('GET', 'students?class_code=eq.'+encodeURIComponent(code), null, (e1, studs) => {
+      const students = Array.isArray(studs) ? studs : [];
+      supabase('GET', 'reports?select=id&class_code=eq.'+encodeURIComponent(code), null, (e2, reps) => {
+        const reports = Array.isArray(reps) ? reps : [];
+        supabase('GET', 'teachers?class_code=eq.'+encodeURIComponent(code), null, (e3, tchs) => {
+          sendJSON(res, {
+            students: students.length,
+            reports: reports.length,
+            teachers: Array.isArray(tchs) ? tchs.length : 0,
+            student_names: students.slice(0, 30).map(s => s.name)
+          });
+        });
+      });
+    });
+    return;
+  }
+
+  // クラス削除
+  // mode: 'class_only'（既定）… クラスの枠だけ消す。児童とレポートは残す。
+  //       'with_students' … 児童・在籍・レポートもまとめて消す。
+  if (req.method === 'DELETE' && req.url.startsWith('/api/classes/')) {
+    const code = decodeURIComponent(req.url.split('/')[3].split('?')[0]);
+    const params = new URL(req.url, 'http://x').searchParams;
+    const schoolCode = params.get('school_code');
+    const mode = params.get('mode') || 'class_only';
+    const confirmName = params.get('confirm') || '';
+
+    if (schoolCode !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+
+    supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(code), null, (e0, rows) => {
+      const cls = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+      if (!cls) { sendJSON(res, { error: 'クラスが見つかりません' }, 404); return; }
+
+      // まとめて消す場合はクラス名の一致を確認する（誤操作を防ぐ）
+      if (mode === 'with_students' && confirmName !== cls.name) {
+        sendJSON(res, { error: 'クラス名が一致しません' }, 400); return;
+      }
+
+      const finish = (detail) => {
+        createNotification({
+          kind: 'system',
+          title: 'クラス「' + cls.name + '」を削除しました',
+          body: detail,
+          audience: 'admin',
+          actor_name: '管理者'
+        }, () => sendJSON(res, { ok: true, mode: mode, detail: detail }));
+      };
+
+      if (mode === 'with_students') {
+        // 児童・在籍・レポート・先生・クラスの順に消す
+        supabase('GET', 'students?select=id&class_code=eq.'+encodeURIComponent(code), null, (e1, studs) => {
+          const ids = (Array.isArray(studs) ? studs : []).map(s => s.id);
+          const delEnroll = (cb) => {
+            if (!ids.length) { cb(); return; }
+            let done = 0;
+            ids.forEach(sid => {
+              supabase('DELETE', 'enrollments?student_id=eq.'+encodeURIComponent(sid), null, () => {
+                done++; if (done === ids.length) cb();
+              });
+            });
+          };
+          delEnroll(() => {
+            supabase('DELETE', 'reports?class_code=eq.'+encodeURIComponent(code), null, () => {
+              supabase('DELETE', 'students?class_code=eq.'+encodeURIComponent(code), null, () => {
+                supabase('DELETE', 'teachers?class_code=eq.'+encodeURIComponent(code), null, () => {
+                  supabase('DELETE', 'classes?class_code=eq.'+encodeURIComponent(code), null, () => {
+                    finish('児童' + ids.length + '人とそのレポートもあわせて削除しました');
+                  });
+                });
+              });
+            });
+          });
+        });
+      } else {
+        // クラスの枠だけ消す。児童とレポートは残し、所属だけ外す。
+        supabase('PATCH', 'students?class_code=eq.'+encodeURIComponent(code),
+          { class_code: '', class_id: null }, () => {
+          supabase('DELETE', 'teachers?class_code=eq.'+encodeURIComponent(code), null, () => {
+            supabase('DELETE', 'classes?class_code=eq.'+encodeURIComponent(code), null, () => {
+              finish('児童とレポートは残し、クラスの所属のみ外しました');
+            });
+          });
+        });
+      }
+    });
+    return;
+  }
+
   // クラスコード認証（児童・先生共通）
   if (req.method === 'POST' && req.url === '/api/verify') {
     readBody(req, (err, body) => {
