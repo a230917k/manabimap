@@ -270,6 +270,58 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 児童のクラスをまとめて変更する（既存児童の割り振り）
+  if (req.method === 'POST' && req.url === '/api/students/assign') {
+    readBody(req, (err, body) => {
+      if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const ids = Array.isArray(body.student_ids) ? body.student_ids : [];
+      const code = body.class_code || '';          // 空文字なら所属を外す
+      const year = parseYear(body.year);
+      if (!ids.length) { sendJSON(res, { ok: true, moved: 0 }); return; }
+
+      const apply = (classId, className) => {
+        let done = 0;
+        ids.forEach(sid => {
+          supabase('PATCH', 'students?id=eq.'+encodeURIComponent(sid),
+            { class_code: code, class_id: classId }, () => {
+            // その年度の在籍も合わせる
+            supabase('GET', 'enrollments?student_id=eq.'+encodeURIComponent(sid)+'&year=eq.'+year, null, (e, rows) => {
+              const after = () => {
+                done++;
+                if (done === ids.length) {
+                  createNotification({
+                    kind: 'system',
+                    title: '児童' + ids.length + '人のクラスを変更しました',
+                    body: code ? ('移動先：' + (className || code)) : 'クラスの所属を外しました',
+                    audience: 'admin',
+                    actor_name: body.actor_name || '管理者'
+                  }, () => sendJSON(res, { ok: true, moved: ids.length }));
+                }
+              };
+              if (Array.isArray(rows) && rows.length) {
+                supabase('PATCH', 'enrollments?id=eq.'+encodeURIComponent(rows[0].id),
+                  { class_code: code, class_id: classId }, after);
+              } else if (code) {
+                supabase('POST', 'enrollments', {
+                  id: 'e' + sid + '_' + year, student_id: sid, year: year,
+                  class_code: code, class_id: classId, grade: '', seq: null, role: ''
+                }, after);
+              } else { after(); }
+            });
+          });
+        });
+      };
+
+      if (!code) { apply(null, ''); return; }
+      supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(code), null, (e, rows) => {
+        const cls = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+        if (!cls) { sendJSON(res, { error: 'クラスが見つかりません' }, 404); return; }
+        apply(cls.id, cls.name);
+      });
+    });
+    return;
+  }
+
   // クラスコード認証（児童・先生共通）
   if (req.method === 'POST' && req.url === '/api/verify') {
     readBody(req, (err, body) => {
@@ -1120,68 +1172,127 @@ const server = http.createServer((req, res) => {
       if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
       const records = body.records || [];
       const importYear = parseYear(body.year);
-      let created = { classes: 0, students: 0, teachers: 0, enrollments: 0 };
-      let pending = records.length;
-      if (!pending) { sendJSON(res, { ok: true, created }); return; }
+      const autoCreateClass = body.auto_create_class !== false;   // 既定で自動作成する
+      let created = { classes: 0, students: 0, teachers: 0, enrollments: 0, auto_classes: [] };
+      if (!records.length) { sendJSON(res, { ok: true, created }); return; }
 
-      const done = () => { if (--pending === 0) sendJSON(res, { ok: true, created }); };
-
+      // ── 手順1：クラスを先にすべて揃える ─────────────
+      // 児童・先生の行が参照しているクラスも、未登録なら作る。
+      // 並列に作ると同じクラスが重複するため、ここだけ順番に処理する。
+      const classRows = records.filter(r => r.type === 'class');
+      const referenced = {};
       records.forEach(r => {
-        if (r.type === 'class') {
-          const cls = {
-            id: 'cls' + Date.now() + Math.random().toString(36).slice(2,5),
-            account_id: r.account_id || genAccountId(),
-            name: r.name,
-            school_code: SCHOOL_CODE,
-            class_code: r.class_code || genAccountId().toLowerCase(),
-            teacher_password: r.teacher_password || genAccountId().toLowerCase(),
-          };
-          supabase('POST', 'classes', cls, (e, d) => { created.classes++; done(); });
-        } else if (r.type === 'student' || r.type === '児童') {
-          const grade = convertGrade(r.grade);
-          const seqVal = r.seq ? parseInt(r.seq) : null;
+        if (r.type === 'class') return;
+        if (r.class_code) referenced[r.class_code] = r.class_name || r.class || '';
+      });
 
-          // 在籍レコードを作る（既存なら更新）
-          const upsertEnrollment = (studentId, classId, isNew) => {
-            const rec = {
-              id: 'e' + studentId + '_' + importYear,
-              student_id: studentId,
-              year: importYear,
-              class_code: r.class_code || '',
-              class_id: classId || null,
-              grade: grade,
-              seq: seqVal,
-              role: r.role || ''
-            };
-            supabase('GET', 'enrollments?student_id=eq.'+encodeURIComponent(studentId)+'&year=eq.'+importYear, null, (e, rows) => {
-              if (Array.isArray(rows) && rows.length) {
-                supabase('PATCH', 'enrollments?id=eq.'+encodeURIComponent(rows[0].id), {
-                  class_code: rec.class_code, class_id: rec.class_id,
-                  grade: rec.grade, seq: rec.seq, role: rec.role
-                }, () => { if (isNew) created.students++; else created.enrollments++; done(); });
-              } else {
-                supabase('POST', 'enrollments', rec, () => { if (isNew) created.students++; else created.enrollments++; done(); });
-              }
+      // class_code → id の対応表
+      const classMap = {};
+
+      const ensureClasses = (cb) => {
+        supabase('GET', 'classes', null, (e, existing) => {
+          (Array.isArray(existing) ? existing : []).forEach(c => { classMap[c.class_code] = c.id; });
+
+          // 作るべきクラスを並べる（CSVのclass行が優先、次に参照されているコード）
+          const todo = [];
+          classRows.forEach(r => {
+            const code = r.class_code || genAccountId().toLowerCase();
+            if (classMap[code]) return;
+            if (todo.some(t => t.class_code === code)) return;
+            todo.push({
+              id: 'cls' + Date.now() + Math.random().toString(36).slice(2,5),
+              account_id: r.account_id || genAccountId(),
+              name: r.name || code,
+              school_code: SCHOOL_CODE,
+              class_code: code,
+              teacher_password: r.teacher_password || genAccountId().toLowerCase()
+            });
+          });
+          if (autoCreateClass) {
+            Object.keys(referenced).forEach(code => {
+              if (classMap[code]) return;
+              if (todo.some(t => t.class_code === code)) return;
+              todo.push({
+                id: 'cls' + Date.now() + Math.random().toString(36).slice(2,5),
+                account_id: genAccountId(),
+                name: referenced[code] || code,   // 名前の指定がなければコードを名前にする
+                school_code: SCHOOL_CODE,
+                class_code: code,
+                teacher_password: genAccountId().toLowerCase(),
+                _auto: true
+              });
+            });
+          }
+
+          if (!todo.length) { cb(); return; }
+          let i = 0;
+          const next = () => {
+            if (i >= todo.length) { cb(); return; }
+            const cls = todo[i++];
+            const isAuto = !!cls._auto;
+            delete cls._auto;
+            supabase('POST', 'classes', cls, () => {
+              classMap[cls.class_code] = cls.id;
+              created.classes++;
+              if (isAuto) created.auto_classes.push({ class_code: cls.class_code, name: cls.name });
+              next();
             });
           };
+          next();
+        });
+      };
 
-          const proceed = (classId) => {
-            // 既存児童を account_id で照合（なければ氏名）
+      // ── 手順2：児童と先生を登録する ─────────────────
+      const importRows = () => {
+        const rows = records.filter(r => r.type !== 'class');
+        let pending = rows.length;
+        if (!pending) { sendJSON(res, { ok: true, created }); return; }
+        const done = () => { if (--pending === 0) sendJSON(res, { ok: true, created }); };
+
+        rows.forEach(r => {
+          if (r.type === 'student' || r.type === '児童') {
+            const grade = convertGrade(r.grade);
+            const seqVal = r.seq ? parseInt(r.seq) : null;
+            const classId = r.class_code ? (classMap[r.class_code] || null) : null;
+
+            const upsertEnrollment = (studentId, isNew) => {
+              const rec = {
+                id: 'e' + studentId + '_' + importYear,
+                student_id: studentId,
+                year: importYear,
+                class_code: r.class_code || '',
+                class_id: classId,
+                grade: grade,
+                seq: seqVal,
+                role: r.role || ''
+              };
+              supabase('GET', 'enrollments?student_id=eq.'+encodeURIComponent(studentId)+'&year=eq.'+importYear, null, (e, erows) => {
+                if (Array.isArray(erows) && erows.length) {
+                  supabase('PATCH', 'enrollments?id=eq.'+encodeURIComponent(erows[0].id), {
+                    class_code: rec.class_code, class_id: rec.class_id,
+                    grade: rec.grade, seq: rec.seq, role: rec.role
+                  }, () => { if (isNew) created.students++; else created.enrollments++; done(); });
+                } else {
+                  supabase('POST', 'enrollments', rec, () => { if (isNew) created.students++; else created.enrollments++; done(); });
+                }
+              });
+            };
+
+            // 既存児童は account_id（なければ氏名）で照合する
             const findPath = r.account_id
               ? 'students?account_id=eq.'+encodeURIComponent(r.account_id)
               : 'students?name=eq.'+encodeURIComponent(r.name);
             supabase('GET', findPath, null, (e, found) => {
               if (Array.isArray(found) && found.length) {
-                // 既存児童 → 在籍だけ更新（進級・クラス替え）
                 const sid = found[0].id;
                 supabase('PATCH', 'students?id=eq.'+sid, {
                   grade: grade, grade_lock: grade ? true : false,
-                  class_code: r.class_code || '', class_id: classId || null,
+                  class_code: r.class_code || '', class_id: classId,
                   seq: seqVal, role: r.role || ''
-                }, () => upsertEnrollment(sid, classId, false));
+                }, () => upsertEnrollment(sid, false));
               } else {
                 const sid = 's' + Date.now() + Math.random().toString(36).slice(2,5);
-                const stu = {
+                supabase('POST', 'students', {
                   id: sid,
                   account_id: r.account_id || genAccountId(),
                   name: r.name,
@@ -1191,37 +1302,29 @@ const server = http.createServer((req, res) => {
                   grade: grade,
                   grade_lock: grade ? true : false,
                   class_code: r.class_code || '',
-                  class_id: classId || null,
-                };
-                supabase('POST', 'students', stu, () => upsertEnrollment(sid, classId, true));
+                  class_id: classId
+                }, () => upsertEnrollment(sid, true));
               }
             });
-          };
 
-          if (r.class_code) {
-            supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(r.class_code), null, (e, clsData) => {
-              const cls = Array.isArray(clsData) && clsData.length ? clsData[0] : null;
-              proceed(cls ? cls.id : null);
-            });
+          } else if (r.type === 'teacher' || r.type === '先生') {
+            supabase('POST', 'teachers', {
+              id: 't' + Date.now() + Math.random().toString(36).slice(2,5),
+              account_id: r.account_id || genAccountId(),
+              name: r.name,
+              yomi: r.yomi || '',
+              role: r.role || '',
+              class_code: r.class_code || '',
+              school_code: SCHOOL_CODE,
+              password: r.password || genAccountId().toLowerCase()
+            }, () => { created.teachers++; done(); });
           } else {
-            proceed(null);
+            done();
           }
-        } else if (r.type === 'teacher' || r.type === '先生') {
-          const teacher = {
-            id: 't' + Date.now() + Math.random().toString(36).slice(2,5),
-            account_id: r.account_id || genAccountId(),
-            name: r.name,
-            yomi: r.yomi || '',
-            role: r.role || '',
-            class_code: r.class_code || '',
-            school_code: SCHOOL_CODE,
-            password: r.password || genAccountId().toLowerCase(),
-          };
-          supabase('POST', 'teachers', teacher, (e, d) => { created.teachers++; done(); });
-        } else {
-          done();
-        }
-      });
+        });
+      };
+
+      ensureClasses(importRows);
     });
     return;
   }
