@@ -410,6 +410,25 @@ const server = http.createServer((req, res) => {
   }
 
   // 先生削除
+  // 先生の情報更新（所属クラスの割り当てなど）
+  if (req.method === 'PUT' && req.url.startsWith('/api/teachers/')) {
+    const id = req.url.split('/')[3].split('?')[0];
+    readBody(req, (err, body) => {
+      if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const upd = {};
+      if (body.class_code !== undefined) upd.class_code = body.class_code;
+      if (body.name !== undefined) upd.name = body.name;
+      if (body.yomi !== undefined) upd.yomi = body.yomi;
+      if (body.role !== undefined) upd.role = body.role;
+      if (body.password) upd.password = body.password;
+      if (!Object.keys(upd).length) { sendJSON(res, { ok: true, changed: 0 }); return; }
+      supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(id), upd, () => {
+        sendJSON(res, { ok: true });
+      });
+    });
+    return;
+  }
+
   if (req.method === 'DELETE' && req.url.startsWith('/api/teachers/')) {
     const id = req.url.split('/')[3];
     readBody(req, (err, body) => {
@@ -1308,16 +1327,31 @@ const server = http.createServer((req, res) => {
             });
 
           } else if (r.type === 'teacher' || r.type === '先生') {
-            supabase('POST', 'teachers', {
-              id: 't' + Date.now() + Math.random().toString(36).slice(2,5),
-              account_id: r.account_id || genAccountId(),
-              name: r.name,
-              yomi: r.yomi || '',
-              role: r.role || '',
-              class_code: r.class_code || '',
-              school_code: SCHOOL_CODE,
-              password: r.password || genAccountId().toLowerCase()
-            }, () => { created.teachers++; done(); });
+            // 既存の先生は account_id（なければ氏名）で照合し、重複登録を避ける。
+            // 2回目以降のインポートでは所属クラスだけが更新される。
+            const tFind = r.account_id
+              ? 'teachers?account_id=eq.'+encodeURIComponent(r.account_id)
+              : 'teachers?name=eq.'+encodeURIComponent(r.name);
+            supabase('GET', tFind, null, (e, found) => {
+              const upd = {
+                name: r.name,
+                yomi: r.yomi || '',
+                role: r.role || '',
+                class_code: r.class_code || '',
+                school_code: SCHOOL_CODE
+              };
+              if (r.password) upd.password = r.password;
+              if (Array.isArray(found) && found.length) {
+                supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(found[0].id), upd,
+                  () => { created.teachers++; done(); });
+              } else {
+                supabase('POST', 'teachers', Object.assign({
+                  id: 't' + Date.now() + Math.random().toString(36).slice(2,5),
+                  account_id: r.account_id || genAccountId(),
+                  password: r.password || genAccountId().toLowerCase()
+                }, upd), () => { created.teachers++; done(); });
+              }
+            });
           } else {
             done();
           }
