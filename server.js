@@ -64,6 +64,21 @@ function getSetting(key, fallback, cb) {
   });
 }
 
+// 名簿の「種別」の表記ゆれを吸収する
+function normType(t) {
+  const s = String(t || '').trim();
+  if (/^(class|クラス|学級)$/i.test(s)) return 'class';
+  if (/^(teacher|先生|教職員|教員|職員|教師|スタッフ)$/i.test(s)) return 'teacher';
+  if (/^(student|児童|生徒)$/i.test(s)) return 'student';
+  return s;
+}
+// 「-」などはクラス指定なしとして扱う
+function normClassCode(v) {
+  const s = String(v || '').trim();
+  if (/^[-－ー‐–—]$|^なし$|^無$/.test(s)) return '';
+  return s;
+}
+
 function genAccountId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 紛らわしい文字を除外
   let id = '';
@@ -1198,6 +1213,12 @@ const server = http.createServer((req, res) => {
       // ── 手順1：クラスを先にすべて揃える ─────────────
       // 児童・先生の行が参照しているクラスも、未登録なら作る。
       // 並列に作ると同じクラスが重複するため、ここだけ順番に処理する。
+      // 受け取った段階で種別とクラスコードを整える
+      records.forEach(r => {
+        r.type = normType(r.type);
+        r.class_code = normClassCode(r.class_code);
+      });
+
       const classRows = records.filter(r => r.type === 'class');
       const referenced = {};
       records.forEach(r => {
@@ -1269,7 +1290,7 @@ const server = http.createServer((req, res) => {
         const done = () => { if (--pending === 0) sendJSON(res, { ok: true, created }); };
 
         rows.forEach(r => {
-          if (r.type === 'student' || r.type === '児童') {
+          if (r.type === 'student') {
             const grade = convertGrade(r.grade);
             const seqVal = r.seq ? parseInt(r.seq) : null;
             const classId = r.class_code ? (classMap[r.class_code] || null) : null;
@@ -1326,7 +1347,7 @@ const server = http.createServer((req, res) => {
               }
             });
 
-          } else if (r.type === 'teacher' || r.type === '先生') {
+          } else if (r.type === 'teacher') {
             // 既存の先生は account_id（なければ氏名）で照合し、重複登録を避ける。
             // 2回目以降のインポートでは所属クラスだけが更新される。
             const tFind = r.account_id
