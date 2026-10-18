@@ -201,7 +201,7 @@ const server = http.createServer((req, res) => {
       const students = Array.isArray(studs) ? studs : [];
       supabase('GET', 'reports?select=id&class_code=eq.'+encodeURIComponent(code), null, (e2, reps) => {
         const reports = Array.isArray(reps) ? reps : [];
-        supabase('GET', 'teachers?class_code=eq.'+encodeURIComponent(code), null, (e3, tchs) => {
+        supabase('GET', 'teacher_classes?class_code=eq.'+encodeURIComponent(code), null, (e3, tchs) => {
           sendJSON(res, {
             students: students.length,
             reports: reports.length,
@@ -261,7 +261,7 @@ const server = http.createServer((req, res) => {
           delEnroll(() => {
             supabase('DELETE', 'reports?class_code=eq.'+encodeURIComponent(code), null, () => {
               supabase('DELETE', 'students?class_code=eq.'+encodeURIComponent(code), null, () => {
-                supabase('DELETE', 'teachers?class_code=eq.'+encodeURIComponent(code), null, () => {
+                supabase('DELETE', 'teacher_classes?class_code=eq.'+encodeURIComponent(code), null, () => {
                   supabase('DELETE', 'classes?class_code=eq.'+encodeURIComponent(code), null, () => {
                     finish('児童' + ids.length + '人とそのレポートもあわせて削除しました');
                   });
@@ -274,7 +274,7 @@ const server = http.createServer((req, res) => {
         // クラスの枠だけ消す。児童とレポートは残し、所属だけ外す。
         supabase('PATCH', 'students?class_code=eq.'+encodeURIComponent(code),
           { class_code: '', class_id: null }, () => {
-          supabase('DELETE', 'teachers?class_code=eq.'+encodeURIComponent(code), null, () => {
+          supabase('DELETE', 'teacher_classes?class_code=eq.'+encodeURIComponent(code), null, () => {
             supabase('DELETE', 'classes?class_code=eq.'+encodeURIComponent(code), null, () => {
               finish('児童とレポートは残し、クラスの所属のみ外しました');
             });
@@ -353,40 +353,34 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/api/teacher-login') {
     readBody(req, (err, body) => {
       if (err) { res.writeHead(400); res.end(); return; }
-      const { account_id, password, code } = body;
-      if (account_id) {
-        // 先生アカウントIDでログイン
-        supabase('GET', 'teachers?account_id=eq.'+encodeURIComponent(account_id), null, (err, tData) => {
-          const teacher = Array.isArray(tData) && tData.length ? tData[0] : null;
-          if (!teacher || teacher.password !== password) {
-            sendJSON(res, { ok: false }); return;
-          }
-          // 役割に校長・教頭などが入っていれば管理者として扱う
-          const roleAdmin = /校長|教頭|副校長|管理者/.test(String(teacher.role || ''));
-          const isAdmin = teacher.is_admin === true || roleAdmin;
-          // 所属クラスを取得（クラスを持たない先生もいる）
-          if (!teacher.class_code) {
-            sendJSON(res, { ok: true, class: null, teacher, is_admin: isAdmin, school_code: SCHOOL_CODE });
+      const { account_id, password } = body;
+      if (!account_id) { sendJSON(res, { ok: false }); return; }
+      supabase('GET', 'teachers?account_id=eq.'+encodeURIComponent(account_id), null, (err, tData) => {
+        const teacher = Array.isArray(tData) && tData.length ? tData[0] : null;
+        if (!teacher || teacher.password !== password) { sendJSON(res, { ok: false }); return; }
+
+        const roleAdmin = /校長|教頭|副校長|管理者/.test(String(teacher.role || ''));
+        const isAdmin = teacher.is_admin === true || roleAdmin;
+
+        // 担当クラス（複数）を teacher_classes から取る
+        supabase('GET', 'teacher_classes?teacher_id=eq.'+encodeURIComponent(teacher.id), null, (e, tcRows) => {
+          let codes = (Array.isArray(tcRows) ? tcRows : []).map(r => r.class_code);
+          // 移行前の保険：teacher_classes が空でも class_code があれば使う
+          if (!codes.length && teacher.class_code) codes = [teacher.class_code];
+
+          if (!codes.length) {
+            sendJSON(res, { ok: true, classes: [], teacher, is_admin: isAdmin, school_code: SCHOOL_CODE });
             return;
           }
-          supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(teacher.class_code), null, (err, cData) => {
-            const cls = Array.isArray(cData) && cData.length ? cData[0] : null;
-            sendJSON(res, { ok: true, class: cls, teacher, is_admin: isAdmin, school_code: SCHOOL_CODE });
+          // クラス情報をまとめて取得
+          supabase('GET', 'classes', null, (e2, allCls) => {
+            const map = {};
+            (Array.isArray(allCls) ? allCls : []).forEach(c => { map[c.class_code] = c; });
+            const classes = codes.map(cd => map[cd] || { class_code: cd, name: cd }).filter(Boolean);
+            sendJSON(res, { ok: true, classes, teacher, is_admin: isAdmin, school_code: SCHOOL_CODE });
           });
         });
-      } else if (code) {
-        // クラスコード＋パスワードでログイン（後方互換）
-        supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(code), null, (err, data) => {
-          const cls = Array.isArray(data) && data.length ? data[0] : null;
-          if (cls && cls.teacher_password === password) {
-            sendJSON(res, { ok: true, class: cls });
-          } else {
-            sendJSON(res, { ok: false });
-          }
-        });
-      } else {
-        sendJSON(res, { ok: false });
-      }
+      });
     });
     return;
   }
@@ -425,13 +419,69 @@ const server = http.createServer((req, res) => {
         password: body.password || genAccountId().toLowerCase(),
       };
       supabase('POST', 'teachers', teacher, (err, data) => {
-        sendJSON(res, { ok: true, teacher: Array.isArray(data) ? data[0] : data });
+        // 担当クラスにも紐づける
+        if (teacher.class_code) {
+          supabase('POST', 'teacher_classes', {
+            id: 'tc_' + teacher.id + '_' + teacher.class_code,
+            teacher_id: teacher.id, class_code: teacher.class_code
+          }, () => sendJSON(res, { ok: true, teacher: Array.isArray(data) ? data[0] : data }));
+        } else {
+          sendJSON(res, { ok: true, teacher: Array.isArray(data) ? data[0] : data });
+        }
       });
     });
     return;
   }
 
   // 先生削除
+  // あるクラスの担当先生一覧（teacher_classes 経由）
+  if (req.method === 'GET' && req.url.startsWith('/api/class-teachers/')) {
+    const code = decodeURIComponent(req.url.split('/')[3].split('?')[0]);
+    supabase('GET', 'teacher_classes?class_code=eq.'+encodeURIComponent(code), null, (e, tc) => {
+      const ids = (Array.isArray(tc) ? tc : []).map(r => r.teacher_id);
+      if (!ids.length) { sendJSON(res, []); return; }
+      supabase('GET', 'teachers?id=in.('+ids.map(encodeURIComponent).join(',')+')', null, (e2, tchs) => {
+        sendJSON(res, Array.isArray(tchs) ? tchs : []);
+      });
+    });
+    return;
+  }
+
+  // 先生の担当クラスを追加／削除する
+  // action: 'add' | 'remove'
+  if (req.method === 'POST' && req.url === '/api/teacher-classes') {
+    readBody(req, (err, body) => {
+      if (err || body.school_code !== SCHOOL_CODE) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      const tid = body.teacher_id, code = body.class_code, action = body.action || 'add';
+      if (!tid || !code) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      if (action === 'remove') {
+        supabase('DELETE', 'teacher_classes?teacher_id=eq.'+encodeURIComponent(tid)+'&class_code=eq.'+encodeURIComponent(code), null, () => {
+          sendJSON(res, { ok: true });
+        });
+      } else {
+        // 既にあるか確認してから追加
+        supabase('GET', 'teacher_classes?teacher_id=eq.'+encodeURIComponent(tid)+'&class_code=eq.'+encodeURIComponent(code), null, (e, rows) => {
+          if (Array.isArray(rows) && rows.length) { sendJSON(res, { ok: true, already: true }); return; }
+          supabase('POST', 'teacher_classes', {
+            id: 'tc_' + tid + '_' + code + '_' + Date.now().toString(36),
+            teacher_id: tid, class_code: code
+          }, () => {
+            // 主たるクラスが未設定なら、この機会に埋めておく
+            supabase('GET', 'teachers?id=eq.'+encodeURIComponent(tid), null, (e2, tr) => {
+              const t = (Array.isArray(tr) && tr.length) ? tr[0] : null;
+              if (t && !t.class_code) {
+                supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(tid), { class_code: code }, () => sendJSON(res, { ok: true }));
+              } else {
+                sendJSON(res, { ok: true });
+              }
+            });
+          });
+        });
+      }
+    });
+    return;
+  }
+
   // 管理者権限の付け外し
   // 実行できるのは、学校コードを知っている管理者か、
   // すでに管理者権限を持っている先生のみ。
@@ -1415,15 +1465,28 @@ const server = http.createServer((req, res) => {
               // 役割に校長・教頭などが入っていれば管理者にする
               if (/校長|教頭|副校長|管理者/.test(String(r.role || ''))) upd.is_admin = true;
               if (r.password) upd.password = r.password;
+              // 担当クラスを teacher_classes に紐づける
+              const linkClass = (tid, cb) => {
+                if (!r.class_code) { cb(); return; }
+                supabase('GET', 'teacher_classes?teacher_id=eq.'+encodeURIComponent(tid)+'&class_code=eq.'+encodeURIComponent(r.class_code), null, (e, rows) => {
+                  if (Array.isArray(rows) && rows.length) { cb(); return; }
+                  supabase('POST', 'teacher_classes', {
+                    id: 'tc_' + tid + '_' + r.class_code + '_' + Date.now().toString(36),
+                    teacher_id: tid, class_code: r.class_code
+                  }, cb);
+                });
+              };
               if (Array.isArray(found) && found.length) {
-                supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(found[0].id), upd,
-                  () => { created.teachers++; done(); });
+                const tid = found[0].id;
+                supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(tid), upd,
+                  () => linkClass(tid, () => { created.teachers++; done(); }));
               } else {
+                const tid = 't' + Date.now() + Math.random().toString(36).slice(2,5);
                 supabase('POST', 'teachers', Object.assign({
-                  id: 't' + Date.now() + Math.random().toString(36).slice(2,5),
+                  id: tid,
                   account_id: r.account_id || genAccountId(),
                   password: r.password || genAccountId().toLowerCase()
-                }, upd), () => { created.teachers++; done(); });
+                }, upd), () => linkClass(tid, () => { created.teachers++; done(); }));
               }
             });
           } else {
