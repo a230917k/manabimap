@@ -361,10 +361,17 @@ const server = http.createServer((req, res) => {
           if (!teacher || teacher.password !== password) {
             sendJSON(res, { ok: false }); return;
           }
-          // 所属クラスを取得
+          // 役割に校長・教頭などが入っていれば管理者として扱う
+          const roleAdmin = /校長|教頭|副校長|管理者/.test(String(teacher.role || ''));
+          const isAdmin = teacher.is_admin === true || roleAdmin;
+          // 所属クラスを取得（クラスを持たない先生もいる）
+          if (!teacher.class_code) {
+            sendJSON(res, { ok: true, class: null, teacher, is_admin: isAdmin, school_code: SCHOOL_CODE });
+            return;
+          }
           supabase('GET', 'classes?class_code=eq.'+encodeURIComponent(teacher.class_code), null, (err, cData) => {
             const cls = Array.isArray(cData) && cData.length ? cData[0] : null;
-            sendJSON(res, { ok: true, class: cls, teacher });
+            sendJSON(res, { ok: true, class: cls, teacher, is_admin: isAdmin, school_code: SCHOOL_CODE });
           });
         });
       } else if (code) {
@@ -425,6 +432,50 @@ const server = http.createServer((req, res) => {
   }
 
   // 先生削除
+  // 管理者権限の付け外し
+  // 実行できるのは、学校コードを知っている管理者か、
+  // すでに管理者権限を持っている先生のみ。
+  if (req.method === 'POST' && req.url === '/api/teachers/admin') {
+    readBody(req, (err, body) => {
+      if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const targetId = body.teacher_id;
+      const value = !!body.is_admin;
+      if (!targetId) { sendJSON(res, { error: 'bad request' }, 400); return; }
+
+      const apply = (actorName) => {
+        supabase('GET', 'teachers?id=eq.'+encodeURIComponent(targetId), null, (e, rows) => {
+          const t = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+          if (!t) { sendJSON(res, { error: '先生が見つかりません' }, 404); return; }
+          supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(targetId), { is_admin: value }, () => {
+            createNotification({
+              kind: 'system',
+              title: t.name + '先生の管理者権限を' + (value ? '付与' : '解除') + 'しました',
+              body: value ? '管理者画面を使えるようになりました' : '管理者画面を使えなくなりました',
+              audience: 'admin',
+              actor_name: actorName || '管理者',
+              target_name: t.name
+            }, () => sendJSON(res, { ok: true, is_admin: value }));
+          });
+        });
+      };
+
+      // 学校コードを持っているなら管理者とみなす
+      if (body.school_code === SCHOOL_CODE) { apply(body.actor_name || '管理者'); return; }
+
+      // そうでなければ、操作者自身が管理者権限を持っているか確かめる
+      if (!body.actor_id) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      supabase('GET', 'teachers?id=eq.'+encodeURIComponent(body.actor_id), null, (e, rows) => {
+        const me = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+        const roleAdmin = me && /校長|教頭|副校長|管理者/.test(String(me.role || ''));
+        if (!me || !(me.is_admin === true || roleAdmin)) {
+          sendJSON(res, { error: '権限がありません' }, 403); return;
+        }
+        apply(me.name);
+      });
+    });
+    return;
+  }
+
   // 先生の情報更新（所属クラスの割り当てなど）
   if (req.method === 'PUT' && req.url.startsWith('/api/teachers/')) {
     const id = req.url.split('/')[3].split('?')[0];
@@ -1361,6 +1412,8 @@ const server = http.createServer((req, res) => {
                 class_code: r.class_code || '',
                 school_code: SCHOOL_CODE
               };
+              // 役割に校長・教頭などが入っていれば管理者にする
+              if (/校長|教頭|副校長|管理者/.test(String(r.role || ''))) upd.is_admin = true;
               if (r.password) upd.password = r.password;
               if (Array.isArray(found) && found.length) {
                 supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(found[0].id), upd,
