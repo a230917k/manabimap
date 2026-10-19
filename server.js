@@ -35,6 +35,71 @@ function parseYear(v) {
   return (!isNaN(n) && n >= 2000 && n <= 2100) ? n : currentYear();
 }
 
+// ── 無料AIモデルの選び方 ──────────────────────────
+// openrouter/free は毎回ランダムにモデルを選ぶため、遅いモデルや
+// 「答える前に長く考える」モデルに当たると待ち時間が大幅に伸びる。
+// そこで、無料モデルの一覧を取得して長く考えるタイプを外し、
+// 実際にかかった時間を記録して速いモデルを優先して使う。
+const freeModels = { text: [], vision: [], fetchedAt: 0 };
+const modelStats = {};   // model -> { ms: 平均時間, ok: 成功数, fail: 失敗数 }
+
+function refreshFreeModels(cb) {
+  https.get({ hostname: 'openrouter.ai', path: '/api/v1/models' }, (r) => {
+    const ch = [];
+    r.on('data', d => ch.push(d));
+    r.on('end', () => {
+      try {
+        const list = JSON.parse(Buffer.concat(ch).toString('utf8')).data || [];
+        const isFree = m => /:free$/.test(m.id) ||
+          (m.pricing && Number(m.pricing.prompt) === 0 && Number(m.pricing.completion) === 0);
+        const thinks = m => {
+          const p = m.supported_parameters || [];
+          return p.indexOf('reasoning') >= 0 || p.indexOf('include_reasoning') >= 0;
+        };
+        const usable = list.filter(m => isFree(m) && !thinks(m) && m.id.indexOf('openrouter/') !== 0);
+        const inputs = m => (m.architecture && m.architecture.input_modalities) || [];
+        freeModels.text   = usable.map(m => m.id);
+        freeModels.vision = usable.filter(m => inputs(m).indexOf('image') >= 0).map(m => m.id);
+        freeModels.fetchedAt = Date.now();
+        console.log('[AI] 無料モデル（長考なし）: 文章 ' + freeModels.text.length + ' / 画像 ' + freeModels.vision.length);
+      } catch (e) { console.error('[AI] モデル一覧の取得に失敗:', e.message); }
+      if (cb) cb();
+    });
+  }).on('error', e => { console.error('[AI] モデル一覧の取得に失敗:', e.message); if (cb) cb(); });
+}
+refreshFreeModels();
+setInterval(refreshFreeModels, 6 * 60 * 60 * 1000);   // 6時間ごとに更新（無料モデルは入れ替わるため）
+
+function recordModel(model, ms, ok) {
+  const s = modelStats[model] || (modelStats[model] = { ms: 0, ok: 0, fail: 0 });
+  if (ok) {
+    s.ms = s.ok ? Math.round(s.ms * 0.7 + ms * 0.3) : ms;   // 直近を重めにした平均
+    s.ok++;
+  } else {
+    s.fail++;
+  }
+}
+
+// 次に試すモデルの順番を決める
+function pickModels(needImage, count) {
+  const pool = (needImage ? freeModels.vision : freeModels.text).slice();
+  const score = (id) => {
+    const s = modelStats[id];
+    if (!s) return 20000;                            // まだ試していない
+    const failRate = s.fail / (s.ok + s.fail);
+    if (s.ok === 0) return 999999;                   // 失敗しかしていない
+    return s.ms * (1 + failRate * 3);
+  };
+  pool.sort((a, b) => score(a) - score(b));
+  // 速いモデルを中心に、たまに未試行のモデルも混ぜて新しい候補を見つける
+  const picked = pool.slice(0, count);
+  const untried = pool.filter(id => !modelStats[id]);
+  if (untried.length && Math.random() < 0.15 && picked.indexOf(untried[0]) < 0) {
+    picked.splice(Math.max(0, picked.length - 1), 1, untried[0]);
+  }
+  return picked;
+}
+
 // ── お知らせ ────────────────────────────────────
 function createNotification(n, cb) {
   const rec = {
@@ -889,6 +954,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // AIモデルの選ばれ方を確認する（速さの実績）
+  if (req.method === 'GET' && req.url.startsWith('/api/ai-status')) {
+    const rows = Object.keys(modelStats).map(id => Object.assign({ model: id }, modelStats[id]))
+      .sort((a, b) => (a.ok ? a.ms : 1e9) - (b.ok ? b.ms : 1e9));
+    sendJSON(res, {
+      text_models: freeModels.text.length,
+      vision_models: freeModels.vision.length,
+      next_text: pickModels(false, 2),
+      next_vision: pickModels(true, 2),
+      stats: rows,
+      fixed_model: process.env.AI_MODEL || null
+    });
+    return;
+  }
+
   // 動作確認用：AI への疎通を1回だけ試す
   if (req.method === 'GET' && req.url.startsWith('/api/ai-check')) {
     const post = JSON.stringify({
@@ -1523,13 +1603,19 @@ const server = http.createServer((req, res) => {
       // やり直しも無料モデル同士で行う（選ばれるモデルが毎回変わるので、
       // 1回目がうまくいかなくても次で別のモデルに当たる）。
       // 有料モデルを使いたいときだけ、Render の環境変数で指定する。
-      const primary  = process.env.AI_MODEL || 'openrouter/free';
-      const fallback = process.env.AI_FALLBACK_MODEL || 'openrouter/free';
-      const attempts = [
-        { model: primary,  maxTokens: baseTokens },
-        { model: fallback, maxTokens: Math.round(baseTokens * 1.5) },
-        { model: fallback, maxTokens: baseTokens * 2 }
-      ];
+      // 試すモデルの順番を決める。
+      // AI_MODEL が設定されていればそれを最優先。なければ、これまでの
+      // 実績で速かった無料モデルから順に試し、最後の保険に openrouter/free。
+      const picked = pickModels(!!image, 2);
+      const order = [];
+      if (process.env.AI_MODEL) order.push(process.env.AI_MODEL);
+      picked.forEach(m => { if (order.indexOf(m) < 0) order.push(m); });
+      order.push(process.env.AI_FALLBACK_MODEL || 'openrouter/free');
+      const attempts = order.slice(0, 3).map((m, i, arr) => ({
+        model: m,
+        maxTokens: i === 0 ? baseTokens : Math.round(baseTokens * 1.5),
+        last: i === arr.length - 1
+      }));
 
       // 返ってきた本文が「使える」か判定する
       const isUsable = (content, finish) => {
@@ -1543,7 +1629,16 @@ const server = http.createServer((req, res) => {
         try { JSON.parse(t.slice(a, b + 1)); return true; } catch (e) { return false; }
       };
 
-      const callOnce = (att, cb) => {
+      const callOnce = (att, cb0) => {
+        const t0 = Date.now();
+        // 結果と一緒にかかった時間を記録する（速いモデルを覚えるため）
+        const cb = (result) => {
+          const ms = Date.now() - t0;
+          const good = result.ok && isUsable(result.content, result.finish);
+          if (att.model !== 'openrouter/free') recordModel(att.model, ms, good);
+          result.ms = ms;
+          cb0(result);
+        };
         const payload = {
           model: att.model,
           messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
@@ -1602,7 +1697,8 @@ const server = http.createServer((req, res) => {
           });
         });
         // 1回あたりの待ち時間に上限を設ける（固まったまま待ち続けないように）
-        r.setTimeout(60000, () => { r.destroy(new Error('timeout')); });
+        // 遅いモデルは早めに見切って次へ（最後の保険だけは少し長く待つ）
+        r.setTimeout(att.last ? 45000 : 25000, () => { r.destroy(new Error('timeout')); });
         r.on('error', e => cb({ ok: false, retry: true, error: e.message === 'timeout' ? 'AIの応答が時間内に返りませんでした' : e.message, log: 'net ' + e.message }));
         r.write(postData);
         r.end();
@@ -1633,7 +1729,7 @@ const server = http.createServer((req, res) => {
             tryAt(i + 1);
             return;
           }
-          if (i > 0) console.log('[AI] try' + (i + 1) + ' で成功 model=' + result.model);
+          console.log('[AI] 成功 try' + (i + 1) + ' model=' + result.model + ' ' + result.ms + 'ms');
           let content = result.content;
           if (!raw) content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
           // 壊れた文字だけを除去する（正しい絵文字は残す）
