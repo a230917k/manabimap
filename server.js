@@ -892,7 +892,7 @@ const server = http.createServer((req, res) => {
   // 動作確認用：AI への疎通を1回だけ試す
   if (req.method === 'GET' && req.url.startsWith('/api/ai-check')) {
     const post = JSON.stringify({
-      model: process.env.AI_MODEL || 'openrouter/auto',
+      model: process.env.AI_MODEL || 'openrouter/free',
       messages: [{ role: 'user', content: '「OK」とだけ返してください。' }],
       max_tokens: 20
     });
@@ -912,7 +912,7 @@ const server = http.createServer((req, res) => {
         const body = Buffer.concat(ch).toString('utf8');
         sendJSON(res, {
           http_status: ar.statusCode,
-          model: process.env.AI_MODEL || 'openrouter/auto',
+          model: process.env.AI_MODEL || 'openrouter/free',
           api_key_set: !!OPENROUTER_API_KEY,
           api_key_head: OPENROUTER_API_KEY ? OPENROUTER_API_KEY.slice(0, 8) + '…' : '(未設定)',
           response: body.slice(0, 600)
@@ -1512,94 +1512,139 @@ const server = http.createServer((req, res) => {
         : (raw
           ? 'あなたは教育の専門家です。指示された内容を日本語で答えてください。JSONは不要です。'
           : 'あなたは日本の学習指導要領の専門家です。必ずJSONのみを返してください。前置き・説明・コードブロック不要。curriculum_referenceは簡潔な1文のみ。');
-      let userContent = image
+      const userContent = image
         ? [{ type: 'image_url', image_url: { url: `data:${mediaType||'image/jpeg'};base64,${image}` } }, { type: 'text', text: prompt }]
         : prompt;
-      // 既定は openrouter/auto。速いモデルに固定したいときは
-      // Render の環境変数 AI_MODEL で指定する。
-      const modelName = process.env.AI_MODEL || 'openrouter/auto';
-      const postData = JSON.stringify({
-        model: modelName,
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
-        temperature: 0.3,
-        // 2〜3教科分のフィードバックが入るため余裕をもたせる。
-        // 足りないと途中で切れて JSON が壊れる。
-        // json は短い辞書しか返さないので小さめでよい
-        max_tokens: json ? 1000 : (raw ? 600 : 4000),
-        stream: false
-      });
-      const options = {
-        hostname: 'openrouter.ai',
-        path: '/api/v1/chat/completions',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
-          'HTTP-Referer': 'https://manabimap.onrender.com',
-          'X-Title': 'ManabiMap',
-          'Content-Length': Buffer.byteLength(postData)
-        }
+      const baseTokens = json ? 1000 : (raw ? 600 : 4000);
+
+      // 試す順番。自動選択では「答える前に長く考える」モデルに当たることがあり、
+      // 考えるだけで上限を使い切って本文が空になる。そのときはやり直す。
+      // 費用をかけないため、既定は無料モデルの自動選択（openrouter/free）。
+      // やり直しも無料モデル同士で行う（選ばれるモデルが毎回変わるので、
+      // 1回目がうまくいかなくても次で別のモデルに当たる）。
+      // 有料モデルを使いたいときだけ、Render の環境変数で指定する。
+      const primary  = process.env.AI_MODEL || 'openrouter/free';
+      const fallback = process.env.AI_FALLBACK_MODEL || 'openrouter/free';
+      const attempts = [
+        { model: primary,  maxTokens: baseTokens },
+        { model: fallback, maxTokens: Math.round(baseTokens * 1.5) },
+        { model: fallback, maxTokens: baseTokens * 2 }
+      ];
+
+      // 返ってきた本文が「使える」か判定する
+      const isUsable = (content, finish) => {
+        if (!content) return false;
+        if (raw) return true;                      // 文章はそのまま使える
+        if (finish !== 'length') return true;      // 最後まで書けている
+        // 途中で切れた JSON は、閉じているところまで読めるかで判断する
+        const t = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+        const a = t.indexOf('{'), b = t.lastIndexOf('}');
+        if (a < 0 || b < 0) return false;
+        try { JSON.parse(t.slice(a, b + 1)); return true; } catch (e) { return false; }
       };
-      const apiReq = https.request(options, (apiRes) => {
-        // 絵文字などの4バイト文字がチャンク境界で割れないよう
-        // Buffer で受けてから一括で UTF-8 変換する
-        const chunks = [];
-        apiRes.on('data', chunk => chunks.push(chunk));
-        apiRes.on('end', () => {
-          const data = Buffer.concat(chunks).toString('utf8');
-          try {
-            // HTTP ステータスが異常ならそのまま伝える
-            if (apiRes.statusCode >= 400) {
-              console.error('[AI] HTTP ' + apiRes.statusCode + ' body=' + data.slice(0, 500));
-              let m = 'AI接続エラー (HTTP ' + apiRes.statusCode + ')';
-              try { const p = JSON.parse(data); if (p.error && p.error.message) m = p.error.message; } catch(e2) {}
-              sendJSON(res, { error: m, content: '' }, 502);
+
+      const callOnce = (att, cb) => {
+        const payload = {
+          model: att.model,
+          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
+          temperature: 0.3,
+          max_tokens: att.maxTokens,
+          // 考える量を抑え、考えた中身は返さない（対応していないモデルでは無視される）
+          reasoning: { effort: 'low', exclude: true },
+          stream: false
+        };
+        const postData = JSON.stringify(payload);
+        const r = https.request({
+          hostname: 'openrouter.ai',
+          path: '/api/v1/chat/completions',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+            'HTTP-Referer': 'https://manabimap.onrender.com',
+            'X-Title': 'ManabiMap',
+            'Content-Length': Buffer.byteLength(postData)
+          }
+        }, (apiRes) => {
+          // 絵文字などの4バイト文字がチャンク境界で割れないよう Buffer で受ける
+          const chunks = [];
+          apiRes.on('data', ch => chunks.push(ch));
+          apiRes.on('end', () => {
+            const data = Buffer.concat(chunks).toString('utf8');
+            if (apiRes.statusCode === 429) {
+              // 無料の利用回数の上限。続けて試すとかえって制限が延びるので止める
+              const daily = /per.?day|daily|requests per day/i.test(data);
+              cb({ ok: false, retry: false,
+                   error: daily
+                     ? '今日のAIの利用回数の上限に達しました。明日もう一度お試しください'
+                     : 'AIが混み合っています。1分ほど待ってからもう一度お試しください',
+                   log: 'HTTP 429 ' + data.slice(0, 300) });
               return;
             }
-            const parsed = JSON.parse(data);
-            // OpenRouter 側のエラーをそのまま伝える（空応答の原因を隠さない）
+            if (apiRes.statusCode >= 400) {
+              let m = 'AI接続エラー (HTTP ' + apiRes.statusCode + ')';
+              try { const p = JSON.parse(data); if (p.error && p.error.message) m = p.error.message; } catch (e2) {}
+              cb({ ok: false, retry: true, error: m, log: 'HTTP ' + apiRes.statusCode + ' ' + data.slice(0, 300) });
+              return;
+            }
+            let parsed;
+            try { parsed = JSON.parse(data); }
+            catch (e) { cb({ ok: false, retry: true, error: 'AI応答の解析に失敗しました', log: 'parse ' + data.slice(0, 300) }); return; }
             if (parsed.error) {
-              console.error('[AI] provider error:', JSON.stringify(parsed.error).slice(0, 400));
               const em = (typeof parsed.error === 'string') ? parsed.error
                        : (parsed.error.message || JSON.stringify(parsed.error).slice(0, 200));
-              sendJSON(res, { error: em, content: '' }, 502);
+              cb({ ok: false, retry: true, error: em, log: 'provider ' + JSON.stringify(parsed.error).slice(0, 300) });
               return;
             }
-            let content = parsed.choices?.[0]?.message?.content || '';
-            if (!content) {
-              const fin = parsed.choices?.[0]?.finish_reason || '';
-              console.error('[AI] empty content. model=' + (parsed.model || '?') + ' finish=' + fin
-                            + ' body=' + data.slice(0, 400));
-              sendJSON(res, {
-                error: fin === 'length'
-                  ? '応答が長すぎて途中で切れました'
-                  : 'AIから空の応答が返りました（model: ' + (parsed.model || '不明') + '）',
-                content: ''
-              }, 502);
-              return;
-            }
-            // 途中で切れていても本文があれば返す。フロント側で拾える分だけ復元する。
-            if (parsed.choices?.[0]?.finish_reason === 'length') {
-              console.warn('[AI] truncated. model=' + (parsed.model || '?') + ' len=' + content.length);
-            }
-            if (!raw) content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-            // 壊れた文字だけを除去する。
-            // 正しいサロゲートペア（絵文字）は残し、対になっていない
-            // 単独サロゲートと置換文字だけを捨てる。
-            content = content
-              .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')  // 対のない上位
-              .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')  // 対のない下位
-              .replace(/\uFFFD/g, '');                                // 置換文字
-            sendJSON(res, { content });
-          } catch(e) {
-            console.error('[AI] parse error:', e.message, 'body=' + String(data).slice(0, 500));
-            sendJSON(res, { error: 'AI応答の解析に失敗しました: ' + e.message, content: '' }, 500);
-          }
+            const content = parsed.choices?.[0]?.message?.content || '';
+            const finish  = parsed.choices?.[0]?.finish_reason || '';
+            cb({ ok: true, content, finish, model: parsed.model || att.model });
+          });
         });
-      });
-      apiReq.on('error', e => sendJSON(res, { error: e.message }, 500));
-      apiReq.write(postData);
-      apiReq.end();
+        // 1回あたりの待ち時間に上限を設ける（固まったまま待ち続けないように）
+        r.setTimeout(60000, () => { r.destroy(new Error('timeout')); });
+        r.on('error', e => cb({ ok: false, retry: true, error: e.message === 'timeout' ? 'AIの応答が時間内に返りませんでした' : e.message, log: 'net ' + e.message }));
+        r.write(postData);
+        r.end();
+      };
+
+      let lastError = 'AIから応答が得られませんでした';
+      const tryAt = (i) => {
+        if (i >= attempts.length) {
+          sendJSON(res, { error: lastError + '。もう一度お試しください。', content: '' }, 502);
+          return;
+        }
+        const att = attempts[i];
+        callOnce(att, (result) => {
+          if (!result.ok) {
+            console.error('[AI] try' + (i + 1) + ' model=' + att.model + ' failed: ' + result.log);
+            lastError = result.error;
+            if (result.retry === false) {
+              sendJSON(res, { error: result.error, content: '' }, 429);
+              return;
+            }
+            tryAt(i + 1);
+            return;
+          }
+          if (!isUsable(result.content, result.finish)) {
+            console.warn('[AI] try' + (i + 1) + ' model=' + result.model + ' unusable (finish=' + result.finish
+                         + ', len=' + result.content.length + ') → やり直します');
+            lastError = result.finish === 'length' ? '応答が長すぎて途中で切れました' : 'AIから空の応答が返りました';
+            tryAt(i + 1);
+            return;
+          }
+          if (i > 0) console.log('[AI] try' + (i + 1) + ' で成功 model=' + result.model);
+          let content = result.content;
+          if (!raw) content = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+          // 壊れた文字だけを除去する（正しい絵文字は残す）
+          content = content
+            .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+            .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')
+            .replace(/\uFFFD/g, '');
+          sendJSON(res, { content, model: result.model, attempts: i + 1 });
+        });
+      };
+      tryAt(0);
     });
     return;
   }
