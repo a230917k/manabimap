@@ -1606,27 +1606,42 @@ const server = http.createServer((req, res) => {
       // 試すモデルの順番を決める。
       // AI_MODEL が設定されていればそれを最優先。なければ、これまでの
       // 実績で速かった無料モデルから順に試し、最後の保険に openrouter/free。
-      const picked = pickModels(!!image, 2);
+      const picked = pickModels(!!image, 3);
       const order = [];
       if (process.env.AI_MODEL) order.push(process.env.AI_MODEL);
       picked.forEach(m => { if (order.indexOf(m) < 0) order.push(m); });
-      order.push(process.env.AI_FALLBACK_MODEL || 'openrouter/free');
-      const attempts = order.slice(0, 3).map((m, i, arr) => ({
+      const fb = process.env.AI_FALLBACK_MODEL || 'openrouter/free';
+      // 実績のあるモデルを3つまで試し、最後の保険に自動選択を残す
+      const head = order.filter(m => m !== fb).slice(0, 3);
+      head.push(fb);
+      const attempts = head.map((m, i, arr) => ({
         model: m,
         maxTokens: i === 0 ? baseTokens : Math.round(baseTokens * 1.5),
         last: i === arr.length - 1
       }));
 
       // 返ってきた本文が「使える」か判定する
+      // 返答の「中身」まで確かめる。届いただけでは成功にしない。
+      // 小さな無料モデルは指示を守れず、形だけの返答をすることがあるため。
       const isUsable = (content, finish) => {
-        if (!content) return false;
-        if (raw) return true;                      // 文章はそのまま使える
-        if (finish !== 'length') return true;      // 最後まで書けている
-        // 途中で切れた JSON は、閉じているところまで読めるかで判断する
+        if (!content || !content.trim()) return false;
+        if (raw) return content.trim().length >= 5;   // 文章は空でなければよい
+
+        // JSON を取り出す（前後に説明文やコードブロックが付いていても読む）
         const t = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
         const a = t.indexOf('{'), b = t.lastIndexOf('}');
         if (a < 0 || b < 0) return false;
-        try { JSON.parse(t.slice(a, b + 1)); return true; } catch (e) { return false; }
+        let obj;
+        try { obj = JSON.parse(t.slice(a, b + 1)); } catch (e) { return false; }
+        if (!obj || typeof obj !== 'object') return false;
+
+        // ふりがな辞書など短い JSON は、中身が1つ以上あればよい
+        if (json) return Object.keys(obj).length > 0;
+
+        // レポートの分析は、教科と内容がそろった判定が1つ以上必要
+        const ms = Array.isArray(obj.mappings) ? obj.mappings : [];
+        const good = ms.filter(m => m && typeof m === 'object' && m.subject && m.unit);
+        return good.length > 0;
       };
 
       const callOnce = (att, cb0) => {
@@ -1725,7 +1740,9 @@ const server = http.createServer((req, res) => {
           if (!isUsable(result.content, result.finish)) {
             console.warn('[AI] try' + (i + 1) + ' model=' + result.model + ' unusable (finish=' + result.finish
                          + ', len=' + result.content.length + ') → やり直します');
-            lastError = result.finish === 'length' ? '応答が長すぎて途中で切れました' : 'AIから空の応答が返りました';
+            lastError = result.finish === 'length'
+              ? '応答が長すぎて途中で切れました'
+              : (result.content ? 'AIがうまく分析できませんでした' : 'AIから空の応答が返りました');
             tryAt(i + 1);
             return;
           }
