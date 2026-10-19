@@ -50,18 +50,25 @@ function refreshFreeModels(cb) {
     r.on('end', () => {
       try {
         const list = JSON.parse(Buffer.concat(ch).toString('utf8')).data || [];
-        const isFree = m => /:free$/.test(m.id) ||
-          (m.pricing && Number(m.pricing.prompt) === 0 && Number(m.pricing.completion) === 0);
-        const thinks = m => {
-          const p = m.supported_parameters || [];
-          return p.indexOf('reasoning') >= 0 || p.indexOf('include_reasoning') >= 0;
+        // 無料かどうかは :free の印で判断する。
+        // 料金0の表示だけを見ると、音楽や画像を作るモデル（例：Lyria）まで拾ってしまう。
+        const isFree = m => /:free$/.test(m.id);
+        const arch = m => m.architecture || {};
+        const inputs  = m => arch(m).input_modalities  || [];
+        const outputs = m => arch(m).output_modalities || [];
+        // 文章を返すモデルだけを使う（音声・画像・音楽を出すモデルは外す）
+        const textOut = m => {
+          const o = outputs(m);
+          if (o.length) return o.indexOf('text') >= 0 && !o.some(x => /audio|image|video|music/.test(x));
+          return /->\s*text\s*$/.test(arch(m).modality || '');
         };
-        const usable = list.filter(m => isFree(m) && !thinks(m) && m.id.indexOf('openrouter/') !== 0);
-        const inputs = m => (m.architecture && m.architecture.input_modalities) || [];
+        // 考える機能を「持っている」だけでは外さない（最近の無料モデルはほとんど持っているため）。
+        // 実際に遅いかどうかは、使ったときの時間の記録で判断する。
+        const usable = list.filter(m => isFree(m) && textOut(m) && m.id.indexOf('openrouter/') !== 0);
         freeModels.text   = usable.map(m => m.id);
         freeModels.vision = usable.filter(m => inputs(m).indexOf('image') >= 0).map(m => m.id);
         freeModels.fetchedAt = Date.now();
-        console.log('[AI] 無料モデル（長考なし）: 文章 ' + freeModels.text.length + ' / 画像 ' + freeModels.vision.length);
+        console.log('[AI] 無料の文章モデル: ' + freeModels.text.length + ' / 画像も読めるもの: ' + freeModels.vision.length);
       } catch (e) { console.error('[AI] モデル一覧の取得に失敗:', e.message); }
       if (cb) cb();
     });
@@ -82,7 +89,11 @@ function recordModel(model, ms, ok) {
 
 // 次に試すモデルの順番を決める
 function pickModels(needImage, count) {
-  const pool = (needImage ? freeModels.vision : freeModels.text).slice();
+  // 2回以上試して一度も成功していないモデルは、もう使わない
+  const pool = (needImage ? freeModels.vision : freeModels.text).filter(id => {
+    const s = modelStats[id];
+    return !(s && s.ok === 0 && s.fail >= 2);
+  });
   const score = (id) => {
     const s = modelStats[id];
     if (!s) return 20000;                            // まだ試していない
