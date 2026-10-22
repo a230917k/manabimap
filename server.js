@@ -1397,6 +1397,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // レポート同士のつながりの説明を保存する（一度作った説明を使い回すため）。
+  // 説明は新しいほうのレポートの result.connections に入れる。
+  if (req.method === 'POST' && req.url === '/api/reports/connection') {
+    readBody(req, (err, body) => {
+      if (err || !body.report_id || !body.other_id || !body.reason) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      supabase('GET', 'reports?select=id,result&id=eq.'+encodeURIComponent(body.report_id), null, (e, rows) => {
+        const rep = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+        if (!rep) { sendJSON(res, { error: 'not found' }, 404); return; }
+        const result = (rep.result && typeof rep.result === 'object') ? rep.result : {};
+        const list = Array.isArray(result.connections) ? result.connections : [];
+        const i = list.findIndex(x => x && x.id === body.other_id);
+        const item = { id: body.other_id, reason: String(body.reason).slice(0, 600) };
+        if (i >= 0) list[i] = item; else list.push(item);
+        result.connections = list;
+        supabase('PATCH', 'reports?id=eq.'+encodeURIComponent(body.report_id), { result }, () => {
+          sendJSON(res, { ok: true });
+        });
+      });
+    });
+    return;
+  }
+
   // 先生コメント・点数・既読更新
   if (req.method === 'PUT' && req.url.startsWith('/api/reports/comment/')) {
     const rid = req.url.split('/')[4].split('?')[0];
