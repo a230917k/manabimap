@@ -64,7 +64,9 @@ function refreshFreeModels(cb) {
         };
         // 考える機能を「持っている」だけでは外さない（最近の無料モデルはほとんど持っているため）。
         // 実際に遅いかどうかは、使ったときの時間の記録で判断する。
-        const usable = list.filter(m => isFree(m) && textOut(m) && m.id.indexOf('openrouter/') !== 0);
+        // 安全判定・埋め込み・プログラム専用など、採点に向かない専用モデルを外す
+        const special = m => /safety|guard|moderat|embed|rerank|coder|code-|laguna|tts|whisper/i.test(m.id);
+        const usable = list.filter(m => isFree(m) && textOut(m) && !special(m) && m.id.indexOf('openrouter/') !== 0);
         freeModels.text   = usable.map(m => m.id);
         freeModels.vision = usable.filter(m => inputs(m).indexOf('image') >= 0).map(m => m.id);
         freeModels.fetchedAt = Date.now();
@@ -77,13 +79,17 @@ function refreshFreeModels(cb) {
 refreshFreeModels();
 setInterval(refreshFreeModels, 6 * 60 * 60 * 1000);   // 6時間ごとに更新（無料モデルは入れ替わるため）
 
-function recordModel(model, ms, ok) {
-  const s = modelStats[model] || (modelStats[model] = { ms: 0, ok: 0, fail: 0 });
+function recordModel(model, ms, ok, reason) {
+  const s = modelStats[model] || (modelStats[model] = { ms: 0, ok: 0, fail: 0, reasons: {} });
   if (ok) {
     s.ms = s.ok ? Math.round(s.ms * 0.7 + ms * 0.3) : ms;   // 直近を重めにした平均
     s.ok++;
   } else {
     s.fail++;
+    s.reasons = s.reasons || {};
+    const r = reason || 'その他';
+    s.reasons[r] = (s.reasons[r] || 0) + 1;
+    s.lastFailMs = ms;
   }
 }
 
@@ -965,6 +971,41 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Claude への接続確認（キーが正しく登録されているか）
+  if (req.method === 'GET' && req.url.startsWith('/api/claude-check')) {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      sendJSON(res, { ok: false, message: 'ANTHROPIC_API_KEY が登録されていません。いまは無料モデルで採点しています。' });
+      return;
+    }
+    const model = process.env.CLAUDE_MODEL || 'claude-haiku-5-5';
+    const post = JSON.stringify({ model, max_tokens: 50,
+      messages: [{ role: 'user', content: '「つながりました」とだけ返してください。' }] });
+    const t0 = Date.now();
+    const r = https.request({
+      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY,
+                 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(post) }
+    }, (ar) => {
+      const ch = []; ar.on('data', d => ch.push(d));
+      ar.on('end', () => {
+        const data = Buffer.concat(ch).toString('utf8');
+        let p = null; try { p = JSON.parse(data); } catch (e) {}
+        const ok = ar.statusCode < 400 && p && p.type !== 'error';
+        sendJSON(res, {
+          ok,
+          model,
+          seconds: ((Date.now() - t0) / 1000).toFixed(1),
+          message: ok ? 'Claudeにつながりました。これから採点はClaudeで行います。'
+                      : ('つながりませんでした：' + ((p && p.error && p.error.message) || ('HTTP ' + ar.statusCode))),
+          reply: ok ? (p.content || []).filter(b => b.type === 'text').map(b => b.text).join('') : ''
+        });
+      });
+    });
+    r.on('error', e => sendJSON(res, { ok: false, message: 'つながりませんでした：' + e.message }));
+    r.write(post); r.end();
+    return;
+  }
+
   // AIモデルの選ばれ方を確認する（速さの実績）
   if (req.method === 'GET' && req.url.startsWith('/api/ai-status')) {
     const rows = Object.keys(modelStats).map(id => Object.assign({ model: id }, modelStats[id]))
@@ -1625,11 +1666,20 @@ const server = http.createServer((req, res) => {
       // 実績のあるモデルを3つまで試し、最後の保険に自動選択を残す
       const head = order.filter(m => m !== fb).slice(0, 3);
       head.push(fb);
-      const attempts = head.map((m, i, arr) => ({
+      let attempts = head.map((m, i, arr) => ({
         model: m,
         maxTokens: i === 0 ? baseTokens : Math.round(baseTokens * 1.5),
         last: i === arr.length - 1
       }));
+      // Claude のキーがあれば、Claude を最優先で使う（毎回同じモデルが採点する）。
+      // 失敗したときだけ、念のため2回目の Claude、その後に無料モデルへ回す。
+      if (process.env.ANTHROPIC_API_KEY) {
+        const cm = process.env.CLAUDE_MODEL || 'claude-haiku-5-5';
+        attempts = [
+          { provider: 'anthropic', model: cm, maxTokens: Math.round(baseTokens * 1.5) },
+          { provider: 'anthropic', model: cm, maxTokens: baseTokens * 2 }
+        ].concat(attempts);
+      }
 
       // 返ってきた本文が「使える」か判定する
       // 返答の「中身」まで確かめる。届いただけでは成功にしない。
@@ -1655,13 +1705,80 @@ const server = http.createServer((req, res) => {
         return good.length > 0;
       };
 
+      // Claude API（Anthropic）を直接呼ぶ。返り値の形は無料モデルのときとそろえる。
+      const callClaude = (att, cb) => {
+        const content = image
+          ? [{ type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: image } },
+             { type: 'text', text: prompt }]
+          : prompt;
+        // 温度などのサンプリング設定は送らない（新しい Haiku ではエラーになるため）
+        const post = JSON.stringify({
+          model: att.model,
+          max_tokens: att.maxTokens,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: content }]
+        });
+        const r = https.request({
+          hostname: 'api.anthropic.com',
+          path: '/v1/messages',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': process.env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+            'Content-Length': Buffer.byteLength(post)
+          }
+        }, (apiRes) => {
+          const ch = [];
+          apiRes.on('data', d => ch.push(d));
+          apiRes.on('end', () => {
+            const data = Buffer.concat(ch).toString('utf8');
+            let p = null;
+            try { p = JSON.parse(data); } catch (e) {}
+            if (apiRes.statusCode >= 400 || !p || p.type === 'error') {
+              const em = (p && p.error && p.error.message) || ('HTTP ' + apiRes.statusCode);
+              let friendly = 'Claudeに接続できませんでした';
+              if (/credit|balance|billing/i.test(em)) friendly = '今月のClaudeの利用枠を使い切りました';
+              else if (apiRes.statusCode === 401) friendly = 'ClaudeのAPIキーが正しくありません';
+              else if (apiRes.statusCode === 429) friendly = 'Claudeが混み合っています';
+              cb({ ok: false, retry: true, error: friendly, log: 'HTTP ' + apiRes.statusCode + ' ' + em.slice(0, 300) });
+              return;
+            }
+            // 考えた過程などは除き、本文（text）だけをつなぐ
+            const text = (p.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+            cb({ ok: true, content: text, finish: p.stop_reason === 'max_tokens' ? 'length' : 'stop', model: p.model || att.model });
+          });
+        });
+        r.setTimeout(60000, () => { r.destroy(new Error('timeout')); });
+        r.on('error', e => cb({ ok: false, retry: true,
+          error: e.message === 'timeout' ? 'AIの応答が時間内に返りませんでした' : e.message, log: 'net ' + e.message }));
+        r.write(post);
+        r.end();
+      };
+
       const callOnce = (att, cb0) => {
+        if (att.provider === 'anthropic') {
+          const t0c = Date.now();
+          callClaude(att, (result) => { result.ms = Date.now() - t0c; cb0(result); });
+          return;
+        }
         const t0 = Date.now();
         // 結果と一緒にかかった時間を記録する（速いモデルを覚えるため）
         const cb = (result) => {
           const ms = Date.now() - t0;
           const good = result.ok && isUsable(result.content, result.finish);
-          if (att.model !== 'openrouter/free') recordModel(att.model, ms, good);
+          let reason = '';
+          if (!good) {
+            const lg = String(result.log || '');
+            if (!result.ok && /timeout/.test(lg))        reason = '時間切れ';
+            else if (!result.ok && /HTTP 429/.test(lg)) reason = '回数制限';
+            else if (!result.ok && /HTTP \d+/.test(lg)) reason = '接続エラー(' + (lg.match(/HTTP (\d+)/) || [])[1] + ')';
+            else if (!result.ok)                         reason = '提供元エラー';
+            else if (!result.content)                    reason = result.finish === 'length' ? '考えすぎて空' : '空の返答';
+            else if (result.finish === 'length')         reason = '途中で切れた';
+            else                                         reason = '形が不十分';
+          }
+          if (att.model !== 'openrouter/free') recordModel(att.model, ms, good, reason);
           result.ms = ms;
           cb0(result);
         };
