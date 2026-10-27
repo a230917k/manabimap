@@ -1397,6 +1397,36 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 過去のレポートに、公式の項目（学習指導要領の内容のまとまり）への対応づけを書き込む。
+  // items: [{report_id, idx, official_unit}]
+  if (req.method === 'POST' && req.url === '/api/reports/official') {
+    readBody(req, (err, body) => {
+      if (err || !Array.isArray(body.items)) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const byRep = {};
+      body.items.forEach(it => {
+        if (!it || !it.report_id || typeof it.idx !== 'number') return;
+        (byRep[it.report_id] = byRep[it.report_id] || []).push(it);
+      });
+      const ids = Object.keys(byRep);
+      if (!ids.length) { sendJSON(res, { ok: true, updated: 0 }); return; }
+      let done = 0, updated = 0;
+      ids.forEach(rid => {
+        supabase('GET', 'reports?select=id,result&id=eq.'+encodeURIComponent(rid), null, (e, rows) => {
+          const rep = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+          const finish = () => { done++; if (done === ids.length) sendJSON(res, { ok: true, updated }); };
+          if (!rep || !rep.result || !Array.isArray(rep.result.mappings)) { finish(); return; }
+          const result = rep.result;
+          byRep[rid].forEach(it => {
+            const m = result.mappings[it.idx];
+            if (m) { m.official_unit = String(it.official_unit || '').slice(0, 100); updated++; }
+          });
+          supabase('PATCH', 'reports?id=eq.'+encodeURIComponent(rid), { result }, finish);
+        });
+      });
+    });
+    return;
+  }
+
   // レポート同士のつながりの説明を保存する（一度作った説明を使い回すため）。
   // 説明は新しいほうのレポートの result.connections に入れる。
   if (req.method === 'POST' && req.url === '/api/reports/connection') {
