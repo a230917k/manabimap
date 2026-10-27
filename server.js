@@ -1397,6 +1397,34 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 過去のレポートに、レポート全体の評価（思考深度と3観点）を書き込む。
+  // 教科ごとの点数・フィードバック・総合コメントは書き換えない。
+  // items: [{report_id, report_eval:{depth,knowledge,thinking,attitude}}]
+  if (req.method === 'POST' && req.url === '/api/reports/report-eval') {
+    readBody(req, (err, body) => {
+      if (err || !Array.isArray(body.items)) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const keys = ['depth', 'knowledge', 'thinking', 'attitude'];
+      const items = body.items.filter(it => it && it.report_id && it.report_eval &&
+        keys.every(k => !isNaN(Number(it.report_eval[k]))));
+      if (!items.length) { sendJSON(res, { ok: true, updated: 0 }); return; }
+      let done = 0, updated = 0;
+      items.forEach(it => {
+        supabase('GET', 'reports?select=id,result&id=eq.'+encodeURIComponent(it.report_id), null, (e, rows) => {
+          const rep = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+          const finish = () => { done++; if (done === items.length) sendJSON(res, { ok: true, updated }); };
+          if (!rep || !rep.result || typeof rep.result !== 'object') { finish(); return; }
+          const result = rep.result;
+          const ev = {};
+          keys.forEach(k => { ev[k] = Math.max(0, Math.min(100, Math.round(Number(it.report_eval[k])))); });
+          result.report_eval = ev;
+          updated++;
+          supabase('PATCH', 'reports?id=eq.'+encodeURIComponent(it.report_id), { result }, finish);
+        });
+      });
+    });
+    return;
+  }
+
   // 過去のレポートに、公式の項目（学習指導要領の内容のまとまり）への対応づけを書き込む。
   // items: [{report_id, idx, official_unit}]
   if (req.method === 'POST' && req.url === '/api/reports/official') {
@@ -1756,10 +1784,13 @@ const server = http.createServer((req, res) => {
         const ms = Array.isArray(obj.mappings) ? obj.mappings : [];
         const good = ms.filter(m => m && typeof m === 'object' && m.subject && m.unit);
         if (!good.length) return false;
-        // 見本の0をそのまま写しただけの返答は採点されていないので使わない
-        const scores = good.map(m => Number(m.score)).filter(n => !isNaN(n));
-        if (!scores.length || scores.every(n => n === 0)) return false;
-        return true;
+        // 見本の0をそのまま写しただけの返答は採点されていないので使わない。
+        // 総合点はシステムが計算するので、思考深度と3観点の点数で判断する
+        const scored = good.some(m => {
+          const sd = (m.score_detail && typeof m.score_detail === 'object') ? m.score_detail : {};
+          return ['depth', 'knowledge', 'thinking', 'attitude'].some(k => Number(sd[k]) > 0) || Number(m.score) > 0;
+        });
+        return scored;
       };
 
       // Claude API（Anthropic）を直接呼ぶ。返り値の形は無料モデルのときとそろえる。
