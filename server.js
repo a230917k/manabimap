@@ -1669,7 +1669,8 @@ const server = http.createServer((req, res) => {
       const userContent = image
         ? [{ type: 'image_url', image_url: { url: `data:${mediaType||'image/jpeg'};base64,${image}` } }, { type: 'text', text: prompt }]
         : prompt;
-      const baseTokens = json ? 1000 : (raw ? 600 : 4000);
+      // 分析は教科ごとに2〜3文×3見出しを書くので、上限に余裕を持たせる
+      const baseTokens = json ? 1000 : (raw ? 600 : 5500);
 
       // 試す順番。自動選択では「答える前に長く考える」モデルに当たることがあり、
       // 考えるだけで上限を使い切って本文が空になる。そのときはやり直す。
