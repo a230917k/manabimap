@@ -1755,7 +1755,11 @@ const server = http.createServer((req, res) => {
         // レポートの分析は、教科と内容がそろった判定が1つ以上必要
         const ms = Array.isArray(obj.mappings) ? obj.mappings : [];
         const good = ms.filter(m => m && typeof m === 'object' && m.subject && m.unit);
-        return good.length > 0;
+        if (!good.length) return false;
+        // 見本の0をそのまま写しただけの返答は採点されていないので使わない
+        const scores = good.map(m => Number(m.score)).filter(n => !isNaN(n));
+        if (!scores.length || scores.every(n => n === 0)) return false;
+        return true;
       };
 
       // Claude API（Anthropic）を直接呼ぶ。返り値の形は無料モデルのときとそろえる。
