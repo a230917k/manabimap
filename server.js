@@ -1301,9 +1301,15 @@ const server = http.createServer((req, res) => {
           link_id: assignment.id
         };
         const tt = assignment.target_type, tv = assignment.target_value;
-        if (tt === 'student' && tv) {
-          // 個人指定（カンマ区切りの児童ID）
-          String(tv).split(',').map(s => s.trim()).filter(Boolean).forEach(sid => {
+        // 個人・グループ指定は、指定された児童だけに届ける
+        // （画面からは児童IDの一覧がJSONで送られてくる）
+        let pickedIds = null;
+        if (tt === 'individual' || tt === 'group' || tt === 'student') {
+          try { const arr = JSON.parse(tv || '[]'); if (Array.isArray(arr)) pickedIds = arr; } catch (e) {}
+          if (!pickedIds) pickedIds = String(tv || '').split(',').map(s => s.trim()).filter(Boolean);
+        }
+        if (pickedIds) {
+          pickedIds.forEach(sid => {
             createNotification(Object.assign({}, notif, { audience: 'student', audience_key: sid }), () => {});
           });
           sendJSON(res, { ok: true, assignment: Array.isArray(data)?data[0]:data });
