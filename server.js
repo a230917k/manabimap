@@ -1119,6 +1119,45 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // クラスごとの表示（今の表示／冒険の地図）を設定する。
+  // 管理者（学校コード）か、そのクラスを担当している先生・管理者権限のある先生だけが変えられる。
+  // value: 'classic' | 'adventure' | ''（空なら学校の初期設定に従う）
+  if (req.method === 'POST' && req.url === '/api/settings/class-display') {
+    readBody(req, (err, body) => {
+      if (err || !body.class_code) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const value = ['classic', 'adventure'].indexOf(body.value) >= 0 ? body.value : '';
+      const key = 'display_mode:class:' + body.class_code;
+      const save = () => {
+        supabase('GET', 'school_settings?key=eq.'+encodeURIComponent(key), null, (e, rows) => {
+          const done = (e2, d2, st) => {
+            if (e2 || (st && st >= 400)) { sendJSON(res, { error: '保存できませんでした' }, 500); return; }
+            sendJSON(res, { ok: true, value });
+          };
+          if (Array.isArray(rows) && rows.length) {
+            supabase('PATCH', 'school_settings?key=eq.'+encodeURIComponent(key),
+              { value, updated_at: new Date().toISOString() }, done);
+          } else {
+            supabase('POST', 'school_settings', { key, value }, done);
+          }
+        });
+      };
+      if (body.school_code === SCHOOL_CODE) { save(); return; }
+      if (!body.actor_id) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      supabase('GET', 'teachers?id=eq.'+encodeURIComponent(body.actor_id), null, (e, trs) => {
+        const me = (Array.isArray(trs) && trs.length) ? trs[0] : null;
+        if (!me) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+        const roleAdmin = /校長|教頭|副校長|管理者/.test(String(me.role || ''));
+        if (me.is_admin === true || roleAdmin) { save(); return; }
+        supabase('GET', 'teacher_classes?teacher_id=eq.'+encodeURIComponent(me.id)+'&class_code=eq.'+encodeURIComponent(body.class_code), null, (e3, tc) => {
+          const assigned = (Array.isArray(tc) && tc.length) || me.class_code === body.class_code;
+          if (!assigned) { sendJSON(res, { error: 'このクラスの設定は変えられません' }, 403); return; }
+          save();
+        });
+      });
+    });
+    return;
+  }
+
   // 学校設定の取得・更新
   if (req.method === 'GET' && req.url.startsWith('/api/settings')) {
     supabase('GET', 'school_settings', null, (e, rows) => {
@@ -1169,7 +1208,18 @@ const server = http.createServer((req, res) => {
         date: body.date || new Date().toISOString(),
         year: body.year || currentYear(body.date)
       };
-      supabase('POST', 'reports', report, (err, data) => {
+      supabase('POST', 'reports', report, (err, data, status) => {
+        // 保存に失敗したときは、失敗したと返す（以前は失敗しても成功と返していた）
+        if (err || (status && status >= 400)) {
+          // 同じIDのレポートがすでに保存されている（送り直し）なら成功として扱う
+          if (status === 409) { sendJSON(res, { ok: true, already: true }); return; }
+          // data は届かなかったときに undefined になるので、文字列化を安全に行う
+          let detail = '';
+          try { detail = err ? String(err.message || err) : String(JSON.stringify(data) || ''); } catch (e) {}
+          console.error('[report save] 失敗 status=' + status + ' ' + detail.slice(0, 300));
+          sendJSON(res, { ok: false, error: 'レポートを保存できませんでした' }, 500);
+          return;
+        }
         sendJSON(res, { ok: true, report: Array.isArray(data) ? data[0] : data });
       });
     });
