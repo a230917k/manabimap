@@ -1119,6 +1119,31 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 先生自身の画面の表示（今の表示／冒険の地図）を設定する。子どもの画面には影響しない。
+  // value: 'classic' | 'adventure' | ''（空ならクラス・学校の設定に従う）
+  if (req.method === 'POST' && req.url === '/api/settings/teacher-display') {
+    readBody(req, (err, body) => {
+      if (err || !body.teacher_id) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const value = ['classic', 'adventure'].indexOf(body.value) >= 0 ? body.value : '';
+      supabase('GET', 'teachers?select=id&id=eq.'+encodeURIComponent(body.teacher_id), null, (e, trs) => {
+        if (!(Array.isArray(trs) && trs.length)) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+        const key = 'display_mode:teacher:' + body.teacher_id;
+        supabase('GET', 'school_settings?key=eq.'+encodeURIComponent(key), null, (e2, rows) => {
+          const done = (e3, d3, st) => {
+            if (e3 || (st && st >= 400)) { sendJSON(res, { error: '保存できませんでした' }, 500); return; }
+            sendJSON(res, { ok: true, value });
+          };
+          if (Array.isArray(rows) && rows.length) {
+            supabase('PATCH', 'school_settings?key=eq.'+encodeURIComponent(key), { value, updated_at: new Date().toISOString() }, done);
+          } else {
+            supabase('POST', 'school_settings', { key, value }, done);
+          }
+        });
+      });
+    });
+    return;
+  }
+
   // クラスごとの表示（今の表示／冒険の地図）を設定する。
   // 管理者（学校コード）か、そのクラスを担当している先生・管理者権限のある先生だけが変えられる。
   // value: 'classic' | 'adventure' | ''（空なら学校の初期設定に従う）
