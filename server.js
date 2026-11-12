@@ -1506,6 +1506,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 過去のレポートに、考えの深さの理由とアドバイス（depth_note）だけを書き込む。
+  // 点数・レベル・フィードバック・総合コメントなど、ほかの項目には一切触れない。
+  // items: [{report_id, reason, advice}]
+  if (req.method === 'POST' && req.url === '/api/reports/depth-note') {
+    readBody(req, (err, body) => {
+      if (err || !Array.isArray(body.items)) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const clip = v => String(v || '').replace(/<[^>]+>/g, '').trim().slice(0, 240);
+      const items = body.items.filter(it => it && it.report_id && (clip(it.reason) || clip(it.advice)));
+      if (!items.length) { sendJSON(res, { ok: true, updated: 0 }); return; }
+      let done = 0, updated = 0;
+      items.forEach(it => {
+        supabase('GET', 'reports?select=id,result&id=eq.'+encodeURIComponent(it.report_id), null, (e, rows) => {
+          const rep = (Array.isArray(rows) && rows.length) ? rows[0] : null;
+          const finish = () => { done++; if (done === items.length) sendJSON(res, { ok: true, updated }); };
+          if (!rep || !rep.result || typeof rep.result !== 'object') { finish(); return; }
+          const result = rep.result;
+          result.depth_note = { reason: clip(it.reason), advice: clip(it.advice) };
+          supabase('PATCH', 'reports?id=eq.'+encodeURIComponent(it.report_id), { result }, (e2, d2, st) => {
+            if (!e2 && !(st && st >= 400)) updated++;
+            finish();
+          });
+        });
+      });
+    });
+    return;
+  }
+
   // 過去のレポートに、公式の項目（学習指導要領の内容のまとまり）への対応づけを書き込む。
   // items: [{report_id, idx, official_unit}]
   if (req.method === 'POST' && req.url === '/api/reports/official') {
