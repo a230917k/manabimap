@@ -1183,11 +1183,47 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // アカウントのアイコン（児童・先生が自分で選ぶ）。school_settings に 'avatar:student:<id>' / 'avatar:teacher:<id>' で保存
+  // value: ''（もとに戻す） | 'preset:<名前>'（用意した絵） | 'data:image/jpeg;base64,...'（写真。小さく縮めたもの）
+  if (req.method === 'GET' && req.url === '/api/avatars') {
+    supabase('GET', 'school_settings?select=key,value&key=like.avatar:*', null, (e, rows) => {
+      const out = {};
+      (Array.isArray(rows) ? rows : []).forEach(r => { if (r.value) out[r.key] = r.value; });
+      sendJSON(res, out);
+    });
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/avatar') {
+    readBody(req, (err, body) => {
+      if (err || !body.id || ['student', 'teacher'].indexOf(body.kind) < 0) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const v = String(body.value || '');
+      const ok = v === '' || /^preset:[a-z0-9_-]{1,30}$/.test(v) || (/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(v) && v.length <= 90000);
+      if (!ok) { sendJSON(res, { error: 'この画像は使えません' }, 400); return; }
+      const table = body.kind === 'student' ? 'students' : 'teachers';
+      supabase('GET', table + '?select=id&id=eq.' + encodeURIComponent(body.id), null, (e, found) => {
+        if (!(Array.isArray(found) && found.length)) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+        const key = 'avatar:' + body.kind + ':' + body.id;
+        supabase('GET', 'school_settings?select=key&key=eq.' + encodeURIComponent(key), null, (e2, rows) => {
+          const done = (e3, d3, st) => {
+            if (e3 || (st && st >= 400)) { sendJSON(res, { error: '保存できませんでした' }, 500); return; }
+            sendJSON(res, { ok: true, value: v });
+          };
+          if (Array.isArray(rows) && rows.length) {
+            supabase('PATCH', 'school_settings?key=eq.' + encodeURIComponent(key), { value: v, updated_at: new Date().toISOString() }, done);
+          } else {
+            supabase('POST', 'school_settings', { key, value: v }, done);
+          }
+        });
+      });
+    });
+    return;
+  }
+
   // 学校設定の取得・更新
   if (req.method === 'GET' && req.url.startsWith('/api/settings')) {
     supabase('GET', 'school_settings', null, (e, rows) => {
       const out = {};
-      (Array.isArray(rows) ? rows : []).forEach(r => { out[r.key] = r.value; });
+      (Array.isArray(rows) ? rows : []).forEach(r => { if (String(r.key).indexOf('avatar:') !== 0) out[r.key] = r.value; });
       sendJSON(res, out);
     });
     return;
