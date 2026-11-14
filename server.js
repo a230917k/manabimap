@@ -1,4 +1,6 @@
 const http = require('http');
+// ゲストの採点の回数（回線ごと。サーバーのメモリに持つので、再起動で空になる）
+let _guestAnalyzeLog = {};
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -1860,6 +1862,18 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/api/analyze') {
     readBody(req, (err, body) => {
       if (err) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      // ゲスト（ログインせずに試す人）からの採点は、同じ回線ごとに回数の上限を設ける
+      if (body && body.code === '__guest__') {
+        const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+        const now = Date.now();
+        const hist = (_guestAnalyzeLog[ip] || []).filter(t => now - t < 24 * 3600 * 1000);
+        const recent = hist.filter(t => now - t < 10 * 60 * 1000).length;
+        if (recent >= 15 || hist.length >= 50) {
+          sendJSON(res, { error: 'ゲストで ためせる かいすうを こえました。しばらく まってから、もう いちど ためしてね。', code: 'guest_limit' }, 429);
+          return;
+        }
+        hist.push(now); _guestAnalyzeLog[ip] = hist;
+      }
       const { prompt, raw, json, image, mediaType } = body;
       // json:true … 短いJSONを求めるとき（ふりがな辞書など）
       // raw:true  … 普通の文章で答えてほしいとき
