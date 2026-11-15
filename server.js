@@ -1,6 +1,36 @@
 const http = require('http');
 // ゲストの採点の回数（回線ごと。サーバーのメモリに持つので、再起動で空になる）
 let _guestAnalyzeLog = {};
+// ── パスワードの安全な保存 ──
+// 'scrypt$<塩>$<ハッシュ>' の形で保存する。元のパスワードには戻せない。
+// これまで平文で保存されていたパスワードは、その先生が次にログインしたときに自動で安全な形に置きかえる。
+const _crypto = require('crypto');
+function hashPassword(pw) {
+  const salt = _crypto.randomBytes(16).toString('hex');
+  const h = _crypto.scryptSync(String(pw), salt, 32).toString('hex');
+  return 'scrypt$' + salt + '$' + h;
+}
+function isHashed(stored) { return typeof stored === 'string' && stored.indexOf('scrypt$') === 0; }
+function verifyPassword(stored, input) {
+  if (stored == null || input == null) return false;
+  if (!isHashed(stored)) return String(stored) === String(input);   // まだ平文のもの
+  const parts = stored.split('$');
+  if (parts.length !== 3) return false;
+  const h = _crypto.scryptSync(String(input), parts[1], 32);
+  const want = Buffer.from(parts[2], 'hex');
+  return want.length === h.length && _crypto.timingSafeEqual(want, h);
+}
+// 先生の情報を画面に返すときは、パスワードを含めない
+function stripPw(t) {
+  if (!t || typeof t !== 'object') return t;
+  const o = Object.assign({}, t); delete o.password; return o;
+}
+function genPassword() {
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let p = ''; const b = _crypto.randomBytes(8);
+  for (let i = 0; i < 8; i++) p += chars[b[i] % chars.length];
+  return p;
+}
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -440,8 +470,13 @@ const server = http.createServer((req, res) => {
       const { account_id, password } = body;
       if (!account_id) { sendJSON(res, { ok: false }); return; }
       supabase('GET', 'teachers?account_id=eq.'+encodeURIComponent(account_id), null, (err, tData) => {
-        const teacher = Array.isArray(tData) && tData.length ? tData[0] : null;
-        if (!teacher || teacher.password !== password) { sendJSON(res, { ok: false }); return; }
+        const found = Array.isArray(tData) && tData.length ? tData[0] : null;
+        if (!found || !verifyPassword(found.password, password)) { sendJSON(res, { ok: false }); return; }
+        // まだ平文で保存されていたら、安全な形に置きかえる
+        if (!isHashed(found.password)) {
+          supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(found.id), { password: hashPassword(password) }, () => {});
+        }
+        const teacher = stripPw(found);
 
         const roleAdmin = /校長|教頭|副校長|管理者/.test(String(teacher.role || ''));
         const isAdmin = teacher.is_admin === true || roleAdmin;
@@ -476,11 +511,11 @@ const server = http.createServer((req, res) => {
     const schoolCode = params.get('school_code');
     if (schoolCode && schoolCode === SCHOOL_CODE) {
       supabase('GET', 'teachers?school_code=eq.'+encodeURIComponent(schoolCode)+'&order=created_at.asc', null, (err, data) => {
-        sendJSON(res, data || []);
+        sendJSON(res, (Array.isArray(data) ? data : []).map(stripPw));
       });
     } else if (classCode) {
       supabase('GET', 'teachers?class_code=eq.'+encodeURIComponent(classCode)+'&order=created_at.asc', null, (err, data) => {
-        sendJSON(res, data || []);
+        sendJSON(res, (Array.isArray(data) ? data : []).map(stripPw));
       });
     } else {
       sendJSON(res, { error: 'unauthorized' }, 403);
@@ -500,18 +535,39 @@ const server = http.createServer((req, res) => {
         role: body.role || '',
         class_code: body.class_code,
         school_code: SCHOOL_CODE,
-        password: body.password || genAccountId().toLowerCase(),
+        password: '',
       };
+      const initialPw = body.password || genPassword();
+      teacher.password = hashPassword(initialPw);
       supabase('POST', 'teachers', teacher, (err, data) => {
+        data = Array.isArray(data) ? data.map(stripPw) : stripPw(data);
         // 担当クラスにも紐づける
         if (teacher.class_code) {
           supabase('POST', 'teacher_classes', {
             id: 'tc_' + teacher.id + '_' + teacher.class_code,
             teacher_id: teacher.id, class_code: teacher.class_code
-          }, () => sendJSON(res, { ok: true, teacher: Array.isArray(data) ? data[0] : data }));
+          }, () => sendJSON(res, { ok: true, teacher: Array.isArray(data) ? data[0] : data, initial_password: initialPw }));
         } else {
-          sendJSON(res, { ok: true, teacher: Array.isArray(data) ? data[0] : data });
+          sendJSON(res, { ok: true, teacher: Array.isArray(data) ? data[0] : data, initial_password: initialPw });
         }
+      });
+    });
+    return;
+  }
+
+  // 先生が自分のパスワードを変える。今のパスワードが合っているときだけ変える
+  if (req.method === 'POST' && req.url === '/api/teachers/password') {
+    readBody(req, (err, body) => {
+      if (err || !body.teacher_id || !body.current || !body.next) { sendJSON(res, { ok: false, error: '入力が足りません' }, 400); return; }
+      const next = String(body.next);
+      if (next.length < 8) { sendJSON(res, { ok: false, error: 'パスワードは8文字以上にしてください' }, 400); return; }
+      supabase('GET', 'teachers?id=eq.'+encodeURIComponent(body.teacher_id), null, (e, rows) => {
+        const t = Array.isArray(rows) && rows.length ? rows[0] : null;
+        if (!t || !verifyPassword(t.password, body.current)) { sendJSON(res, { ok: false, error: '今のパスワードが違います' }, 403); return; }
+        supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(t.id), { password: hashPassword(next) }, (e2, d2, st) => {
+          if (e2 || (st && st >= 400)) { sendJSON(res, { ok: false, error: '保存できませんでした' }, 500); return; }
+          sendJSON(res, { ok: true });
+        });
       });
     });
     return;
@@ -525,7 +581,7 @@ const server = http.createServer((req, res) => {
       const ids = (Array.isArray(tc) ? tc : []).map(r => r.teacher_id);
       if (!ids.length) { sendJSON(res, []); return; }
       supabase('GET', 'teachers?id=in.('+ids.map(encodeURIComponent).join(',')+')', null, (e2, tchs) => {
-        sendJSON(res, Array.isArray(tchs) ? tchs : []);
+        sendJSON(res, (Array.isArray(tchs) ? tchs : []).map(stripPw));
       });
     });
     return;
@@ -620,10 +676,15 @@ const server = http.createServer((req, res) => {
       if (body.name !== undefined) upd.name = body.name;
       if (body.yomi !== undefined) upd.yomi = body.yomi;
       if (body.role !== undefined) upd.role = body.role;
-      if (body.password) upd.password = body.password;
+      // パスワードの再設定：body.reset_password が true なら新しく発行、body.password があればそれを使う
+      let newPw = null;
+      if (body.reset_password === true) newPw = genPassword();
+      else if (body.password) newPw = String(body.password);
+      if (newPw) upd.password = hashPassword(newPw);
       if (!Object.keys(upd).length) { sendJSON(res, { ok: true, changed: 0 }); return; }
-      supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(id), upd, () => {
-        sendJSON(res, { ok: true });
+      supabase('PATCH', 'teachers?id=eq.'+encodeURIComponent(id), upd, (e, d, st) => {
+        if (e || (st && st >= 400)) { sendJSON(res, { ok: false, error: '保存できませんでした' }, 500); return; }
+        sendJSON(res, newPw ? { ok: true, new_password: newPw } : { ok: true });
       });
     });
     return;
@@ -1121,6 +1182,29 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 先生ごとの設定（今はコメントの定型文だけ）。school_settings に 'teacher_pref:<名前>:<先生のID>' で保存
+  if (req.method === 'POST' && req.url === '/api/settings/teacher-pref') {
+    readBody(req, (err, body) => {
+      const allowed = ['comment_templates'];
+      if (err || !body.teacher_id || allowed.indexOf(body.name) < 0) { sendJSON(res, { ok: false, error: 'bad request' }, 400); return; }
+      const value = String(body.value || '');
+      if (value.length > 20000) { sendJSON(res, { ok: false, error: '長すぎます' }, 400); return; }
+      supabase('GET', 'teachers?select=id&id=eq.'+encodeURIComponent(body.teacher_id), null, (e, ts) => {
+        if (!(Array.isArray(ts) && ts.length)) { sendJSON(res, { ok: false, error: 'unauthorized' }, 403); return; }
+        const key = 'teacher_pref:' + body.name + ':' + body.teacher_id;
+        supabase('GET', 'school_settings?select=key&key=eq.'+encodeURIComponent(key), null, (e2, rows) => {
+          const done = (e3, d3, st) => {
+            if (e3 || (st && st >= 400)) { sendJSON(res, { ok: false, error: '保存できませんでした' }, 500); return; }
+            sendJSON(res, { ok: true });
+          };
+          if (Array.isArray(rows) && rows.length) supabase('PATCH', 'school_settings?key=eq.'+encodeURIComponent(key), { value, updated_at: new Date().toISOString() }, done);
+          else supabase('POST', 'school_settings', { key, value }, done);
+        });
+      });
+    });
+    return;
+  }
+
   // 先生自身の画面の表示（今の表示／冒険の地図）を設定する。子どもの画面には影響しない。
   // value: 'classic' | 'adventure' | ''（空ならクラス・学校の設定に従う）
   if (req.method === 'POST' && req.url === '/api/settings/teacher-display') {
@@ -1544,6 +1628,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // レポートの題名を変える。本人（student_id が一致）か先生（teacher_id が存在）だけ。題名のほかには触れない
+  if (req.method === 'POST' && req.url === '/api/reports/title') {
+    readBody(req, (err, body) => {
+      if (err || !body.report_id) { sendJSON(res, { ok: false, error: 'bad request' }, 400); return; }
+      const title = String(body.title || '').replace(/<[^>]+>/g, '').trim().slice(0, 100);
+      supabase('GET', 'reports?select=id,student_id&id=eq.'+encodeURIComponent(body.report_id), null, (e, rows) => {
+        const rep = Array.isArray(rows) && rows.length ? rows[0] : null;
+        if (!rep) { sendJSON(res, { ok: false, error: 'not found' }, 404); return; }
+        const write = () => supabase('PATCH', 'reports?id=eq.'+encodeURIComponent(rep.id), { title }, (e2, d2, st) => {
+          if (e2 || (st && st >= 400)) { sendJSON(res, { ok: false, error: '保存できませんでした' }, 500); return; }
+          sendJSON(res, { ok: true, title });
+        });
+        if (body.student_id && body.student_id === rep.student_id) { write(); return; }
+        if (!body.teacher_id) { sendJSON(res, { ok: false, error: 'unauthorized' }, 403); return; }
+        supabase('GET', 'teachers?select=id&id=eq.'+encodeURIComponent(body.teacher_id), null, (e3, ts) => {
+          if (Array.isArray(ts) && ts.length) write(); else sendJSON(res, { ok: false, error: 'unauthorized' }, 403);
+        });
+      });
+    });
+    return;
+  }
+
   // 過去のレポートに、考えの深さの理由とアドバイス（depth_note）だけを書き込む。
   // 点数・レベル・フィードバック・総合コメントなど、ほかの項目には一切触れない。
   // items: [{report_id, reason, advice}]
@@ -1667,6 +1773,7 @@ const server = http.createServer((req, res) => {
       const importYear = parseYear(body.year);
       const autoCreateClass = body.auto_create_class !== false;   // 既定で自動作成する
       let created = { classes: 0, students: 0, teachers: 0, enrollments: 0, auto_classes: [] };
+      const issued = [];   // 新しく発行した先生の最初のパスワード（取り込みの結果に1回だけ返す）
       if (!records.length) { sendJSON(res, { ok: true, created }); return; }
 
       // ── 手順1：クラスを先にすべて揃える ─────────────
@@ -1745,8 +1852,8 @@ const server = http.createServer((req, res) => {
       const importRows = () => {
         const rows = records.filter(r => r.type !== 'class');
         let pending = rows.length;
-        if (!pending) { sendJSON(res, { ok: true, created }); return; }
-        const done = () => { if (--pending === 0) sendJSON(res, { ok: true, created }); };
+        if (!pending) { sendJSON(res, { ok: true, created, issued }); return; }
+        const done = () => { if (--pending === 0) sendJSON(res, { ok: true, created, issued }); };
 
         rows.forEach(r => {
           if (r.type === 'student') {
@@ -1822,7 +1929,7 @@ const server = http.createServer((req, res) => {
               };
               // 役割に校長・教頭などが入っていれば管理者にする
               if (/校長|教頭|副校長|管理者/.test(String(r.role || ''))) upd.is_admin = true;
-              if (r.password) upd.password = r.password;
+              if (r.password) upd.password = hashPassword(r.password);
               // 担当クラスを teacher_classes に紐づける
               const linkClass = (tid, cb) => {
                 if (!r.class_code) { cb(); return; }
@@ -1840,11 +1947,14 @@ const server = http.createServer((req, res) => {
                   () => linkClass(tid, () => { created.teachers++; done(); }));
               } else {
                 const tid = 't' + Date.now() + Math.random().toString(36).slice(2,5);
-                supabase('POST', 'teachers', Object.assign({
+                const accId = r.account_id || genAccountId();
+                const pw0 = r.password || genPassword();
+                if (!r.password) issued.push({ name: r.name, account_id: accId, password: pw0 });
+                supabase('POST', 'teachers', Object.assign({}, upd, {
                   id: tid,
-                  account_id: r.account_id || genAccountId(),
-                  password: r.password || genAccountId().toLowerCase()
-                }, upd), () => linkClass(tid, () => { created.teachers++; done(); }));
+                  account_id: accId,
+                  password: hashPassword(pw0)
+                }), () => linkClass(tid, () => { created.teachers++; done(); }));
               }
             });
           } else {
