@@ -25,6 +25,20 @@ function stripPw(t) {
   if (!t || typeof t !== 'object') return t;
   const o = Object.assign({}, t); delete o.password; return o;
 }
+// 採点基準の中身を確かめて整える（重みの合計が100%でなければ null）
+function cleanCriteria(c) {
+        if (!c || typeof c !== 'object') return null;
+        const num = v => Math.round(Number(v) * 10) / 10;
+        const t = c.weights && c.weights.total || {}, sb = c.weights && c.weights.subject || {};
+        const total = { depth: num(t.depth), knowledge: num(t.knowledge), thinking: num(t.thinking), attitude: num(t.attitude) };
+        const subject = { depth: num(sb.depth), obs: num(sb.obs), goal: num(sb.goal) };
+        const okSum = (o) => Object.values(o).every(v => !isNaN(v) && v >= 0 && v <= 100) && Math.abs(Object.values(o).reduce((a, b) => a + b, 0) - 100) <= 0.6;
+        if (!okSum(total) || !okSum(subject)) return null;
+        const txt = v => String(v || '').replace(/<[^>]+>/g, '').slice(0, 1200);
+        const g = c.guide || {};
+        return { name: String(c.name || '').replace(/<[^>]+>/g, '').trim().slice(0, 40) || '名前のない基準', note: txt(c.note).slice(0, 300),
+          weights: { total, subject }, guide: { observation: txt(g.observation), depth_hints: txt(g.depth_hints), feedback: txt(g.feedback) } };
+      }
 function genPassword() {
   const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
   let p = ''; const b = _crypto.randomBytes(8);
@@ -1295,20 +1309,7 @@ const server = http.createServer((req, res) => {
         const list = parse(v, []); list.push(Object.assign({ at: new Date().toISOString(), by: String(body.actor_name || '') }, entry));
         putSetting('criteria:log:' + sfx, JSON.stringify(list.slice(-100)), () => cb());
       });
-      // 基準の中身を確かめて整える
-      const clean = (c) => {
-        if (!c || typeof c !== 'object') return null;
-        const num = v => Math.round(Number(v) * 10) / 10;
-        const t = c.weights && c.weights.total || {}, sb = c.weights && c.weights.subject || {};
-        const total = { depth: num(t.depth), knowledge: num(t.knowledge), thinking: num(t.thinking), attitude: num(t.attitude) };
-        const subject = { depth: num(sb.depth), obs: num(sb.obs), goal: num(sb.goal) };
-        const okSum = (o) => Object.values(o).every(v => !isNaN(v) && v >= 0 && v <= 100) && Math.abs(Object.values(o).reduce((a, b) => a + b, 0) - 100) <= 0.6;
-        if (!okSum(total) || !okSum(subject)) return null;
-        const txt = v => String(v || '').replace(/<[^>]+>/g, '').slice(0, 1200);
-        const g = c.guide || {};
-        return { name: String(c.name || '').replace(/<[^>]+>/g, '').trim().slice(0, 40) || '名前のない基準', note: txt(c.note).slice(0, 300),
-          weights: { total, subject }, guide: { observation: txt(g.observation), depth_hints: txt(g.depth_hints), feedback: txt(g.feedback) } };
-      };
+      const clean = cleanCriteria;
       const run = (isAdminActor) => {
         if ((scope === 'school' || body.action === 'lock') && !isAdminActor) { sendJSON(res, { error: '学校の採点基準は管理者だけが変えられます' }, 403); return; }
         getSetting('criteria:lock:class:' + code, lockV => {
@@ -1591,6 +1592,14 @@ const server = http.createServer((req, res) => {
         target_value: body.target_value || '',
         due_date: body.due_date || null,
       };
+      // この課題で使う採点基準（選んだときだけ）。'standard' か、基準の中身の控え
+      let critValue = null;
+      if (body.criteria && body.criteria.id === 'standard') critValue = JSON.stringify({ id: 'standard', name: '標準' });
+      else if (body.criteria) {
+        const cc = cleanCriteria(body.criteria);
+        if (cc) critValue = JSON.stringify(Object.assign({ id: String(body.criteria.id || '').slice(0, 40), scope: String(body.criteria.scope || '').slice(0, 10) }, cc));
+      }
+      if (critValue) supabase('POST', 'school_settings', { key: 'criteria:assignment:' + assignment.id, value: critValue }, () => {});
       supabase('POST', 'assignments', assignment, (err, data) => {
         // 配信先の児童へお知らせ
         const notif = {
