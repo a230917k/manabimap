@@ -1269,6 +1269,110 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── 採点基準（学校・クラス）────────────────────────────
+  // school_settings に次の形で保存する（値はJSONか文字列）
+  //   criteria:lib:school / criteria:lib:class:<コード>   … 保存した基準の一覧（一度保存した基準は書き換えない）
+  //   criteria:active:school                              … 学校で使う基準（id か 'standard'）
+  //   criteria:active:class:<コード>                      … クラスで使う基準（id か 'school'＝学校に従う か 'standard'）
+  //   criteria:lock:class:<コード>                        … '1' なら標準に固定（研究用。管理者だけが変えられる）
+  //   criteria:log:school / criteria:log:class:<コード>   … 切り替え・保存・削除の記録
+  // action: save | activate | delete | lock
+  if (req.method === 'POST' && req.url === '/api/criteria') {
+    readBody(req, (err, body) => {
+      if (err || !body || ['save', 'activate', 'delete', 'lock'].indexOf(body.action) < 0) { sendJSON(res, { error: 'bad request' }, 400); return; }
+      const scope = body.scope === 'class' ? 'class' : 'school';
+      const code = String(body.class_code || '');
+      if (scope === 'class' && !code) { sendJSON(res, { error: 'クラスが分かりません' }, 400); return; }
+      const sfx = scope === 'school' ? 'school' : 'class:' + code;
+      const getSetting = (key, cb) => supabase('GET', 'school_settings?key=eq.' + encodeURIComponent(key), null, (e, rows) => cb(Array.isArray(rows) && rows.length ? rows[0].value : null));
+      const putSetting = (key, value, cb) => supabase('GET', 'school_settings?select=key&key=eq.' + encodeURIComponent(key), null, (e, rows) => {
+        const done = (e2, d2, st) => cb(!(e2 || (st && st >= 400)));
+        if (Array.isArray(rows) && rows.length) supabase('PATCH', 'school_settings?key=eq.' + encodeURIComponent(key), { value, updated_at: new Date().toISOString() }, done);
+        else supabase('POST', 'school_settings', { key, value }, done);
+      });
+      const parse = (v, d) => { try { const x = JSON.parse(v); return x == null ? d : x; } catch (e) { return d; } };
+      const addLog = (entry, cb) => getSetting('criteria:log:' + sfx, v => {
+        const list = parse(v, []); list.push(Object.assign({ at: new Date().toISOString(), by: String(body.actor_name || '') }, entry));
+        putSetting('criteria:log:' + sfx, JSON.stringify(list.slice(-100)), () => cb());
+      });
+      // 基準の中身を確かめて整える
+      const clean = (c) => {
+        if (!c || typeof c !== 'object') return null;
+        const num = v => Math.round(Number(v) * 10) / 10;
+        const t = c.weights && c.weights.total || {}, sb = c.weights && c.weights.subject || {};
+        const total = { depth: num(t.depth), knowledge: num(t.knowledge), thinking: num(t.thinking), attitude: num(t.attitude) };
+        const subject = { depth: num(sb.depth), obs: num(sb.obs), goal: num(sb.goal) };
+        const okSum = (o) => Object.values(o).every(v => !isNaN(v) && v >= 0 && v <= 100) && Math.abs(Object.values(o).reduce((a, b) => a + b, 0) - 100) <= 0.6;
+        if (!okSum(total) || !okSum(subject)) return null;
+        const txt = v => String(v || '').replace(/<[^>]+>/g, '').slice(0, 1200);
+        const g = c.guide || {};
+        return { name: String(c.name || '').replace(/<[^>]+>/g, '').trim().slice(0, 40) || '名前のない基準', note: txt(c.note).slice(0, 300),
+          weights: { total, subject }, guide: { observation: txt(g.observation), depth_hints: txt(g.depth_hints), feedback: txt(g.feedback) } };
+      };
+      const run = (isAdminActor) => {
+        if ((scope === 'school' || body.action === 'lock') && !isAdminActor) { sendJSON(res, { error: '学校の採点基準は管理者だけが変えられます' }, 403); return; }
+        getSetting('criteria:lock:class:' + code, lockV => {
+          const locked = scope === 'class' && lockV === '1';
+          if (body.action === 'lock') {
+            const v = body.value ? '1' : '';
+            putSetting('criteria:lock:' + sfx, v, ok => ok ? addLog({ action: v ? 'lock' : 'unlock' }, () => sendJSON(res, { ok: true, locked: !!v })) : sendJSON(res, { error: '保存できませんでした' }, 500));
+            return;
+          }
+          if (locked && !isAdminActor && body.action !== 'save') { sendJSON(res, { error: 'このクラスは研究のため標準の基準に固定されています' }, 403); return; }
+          getSetting('criteria:lib:' + sfx, libV => {
+            const lib = parse(libV, []);
+            if (body.action === 'save') {
+              const c = clean(body.criteria);
+              if (!c) { sendJSON(res, { error: '重みの合計を100%にしてください' }, 400); return; }
+              const item = Object.assign({ id: 'crit_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), scope, created_at: new Date().toISOString(), created_by: String(body.actor_name || '') }, c);
+              lib.push(item);
+              putSetting('criteria:lib:' + sfx, JSON.stringify(lib), ok => {
+                if (!ok) { sendJSON(res, { error: '保存できませんでした' }, 500); return; }
+                const after = () => addLog({ action: 'save', id: item.id, name: item.name }, () => sendJSON(res, { ok: true, item }));
+                if (body.activate && !locked) putSetting('criteria:active:' + sfx, item.id, () => addLog({ action: 'activate', id: item.id, name: item.name }, after));
+                else after();
+              });
+              return;
+            }
+            if (body.action === 'activate') {
+              const id = String(body.id || '');
+              const okId = id === 'standard' || (scope === 'class' && id === 'school') || lib.some(x => x.id === id);
+              if (!okId) { sendJSON(res, { error: 'その基準が見つかりません' }, 404); return; }
+              const nm = id === 'standard' ? '標準' : id === 'school' ? '学校の基準に従う' : (lib.find(x => x.id === id) || {}).name;
+              putSetting('criteria:active:' + sfx, id, ok => ok ? addLog({ action: 'activate', id, name: nm }, () => sendJSON(res, { ok: true, active: id })) : sendJSON(res, { error: '保存できませんでした' }, 500));
+              return;
+            }
+            if (body.action === 'delete') {
+              const id = String(body.id || '');
+              getSetting('criteria:active:' + sfx, act => {
+                if (act === id) { sendJSON(res, { error: '使っている基準は削除できません。先に別の基準に切り替えてください' }, 400); return; }
+                const it = lib.find(x => x.id === id);
+                if (!it) { sendJSON(res, { error: 'その基準が見つかりません' }, 404); return; }
+                // 一覧から外すだけ。その基準で採点したレポートには、基準の中身が記録されているので点数は変わらない
+                putSetting('criteria:lib:' + sfx, JSON.stringify(lib.filter(x => x.id !== id)), ok => ok ? addLog({ action: 'delete', id, name: it.name }, () => sendJSON(res, { ok: true })) : sendJSON(res, { error: '保存できませんでした' }, 500));
+              });
+            }
+          });
+        });
+      };
+      if (body.school_code === SCHOOL_CODE) { run(true); return; }
+      if (!body.actor_id) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+      supabase('GET', 'teachers?id=eq.' + encodeURIComponent(body.actor_id), null, (e, trs) => {
+        const me = (Array.isArray(trs) && trs.length) ? trs[0] : null;
+        if (!me) { sendJSON(res, { error: 'unauthorized' }, 403); return; }
+        const adminT = me.is_admin === true || /校長|教頭|副校長|管理者/.test(String(me.role || ''));
+        if (adminT) { run(true); return; }
+        if (scope === 'school' || body.action === 'lock') { run(false); return; }
+        supabase('GET', 'teacher_classes?teacher_id=eq.' + encodeURIComponent(me.id) + '&class_code=eq.' + encodeURIComponent(code), null, (e3, tc) => {
+          const assigned = (Array.isArray(tc) && tc.length) || me.class_code === code;
+          if (!assigned) { sendJSON(res, { error: 'このクラスの採点基準は変えられません' }, 403); return; }
+          run(false);
+        });
+      });
+    });
+    return;
+  }
+
   // アカウントのアイコン（児童・先生が自分で選ぶ）。school_settings に 'avatar:student:<id>' / 'avatar:teacher:<id>' で保存
   // value: ''（もとに戻す） | 'preset:<名前>'（用意した絵） | 'data:image/jpeg;base64,...'（写真。小さく縮めたもの）
   if (req.method === 'GET' && req.url === '/api/avatars') {
